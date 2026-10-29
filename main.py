@@ -94,6 +94,7 @@ def init_db():
         "created_by_id": "TEXT DEFAULT ''",
         "ping_sent": "INTEGER DEFAULT 0",
         "last_stale_message_id": "INTEGER DEFAULT 0",
+        "finish_message_id": "INTEGER DEFAULT 0",
         "mark": "TEXT DEFAULT ''",
     }
 
@@ -606,6 +607,7 @@ def clear_row_by_id(row_id: int):
             created_by_id = '',
             ping_sent = 0,
             last_stale_message_id = 0,
+            finish_message_id = 0,
             mark = ''
         WHERE id = ?
         """,
@@ -614,44 +616,86 @@ def clear_row_by_id(row_id: int):
     db.commit()
 
 
+async def delete_bot_message(channel_id: int, message_id: int) -> bool:
+    """
+    Удаляет сообщение бота одним запросом.
+
+    Раньше сообщение сначала загружалось через fetch_message, а для
+    этого нужно право «Читать историю сообщений». Без него удаление
+    молча не срабатывало. Свои сообщения бот удаляет без доп. прав.
+
+    Возвращает True, если сообщения больше нет в канале.
+    """
+    if not channel_id or not message_id:
+        return True
+
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+
+        await channel.get_partial_message(message_id).delete()
+        print(f"[delete_bot_message] Удалено уведомление {message_id}")
+        return True
+    except discord.NotFound:
+        return True
+    except discord.Forbidden:
+        print(f"[delete_bot_message] Нет прав на удаление сообщения {message_id}")
+    except Exception as e:
+        print(f"[delete_bot_message] Ошибка удаления {message_id}: {e}")
+
+    return False
+
+
 async def delete_previous_stale_message(row_id: int):
-    """Удаляет предыдущее уведомление о просрочке для строки"""
+    """
+    Удаляет уведомление о просрочке строки — например, когда
+    строка снова начала обновляться.
+    """
     row = db.execute(
         "SELECT last_stale_message_id FROM rows WHERE id = ?",
         (row_id,)
     ).fetchone()
-    
-    if not row:
+
+    if not row or not row["last_stale_message_id"]:
         return
-    
-    message_id = row["last_stale_message_id"]
-    if not message_id:
+
+    deleted = await delete_bot_message(STALE_CHANNEL_ID, row["last_stale_message_id"])
+
+    if not deleted:
+        # ID оставляем: следующая проверка (каждые 5 минут) попробует снова
         return
-    
-    try:
-        channel = bot.get_channel(STALE_CHANNEL_ID)
-        if channel is None:
-            channel = await bot.fetch_channel(STALE_CHANNEL_ID)
-        
-        if channel:
-            try:
-                old_message = await channel.fetch_message(message_id)
-                await old_message.delete()
-                print(f"[delete_previous_stale_message] Удалено старое уведомление {message_id} из канала просрочек")
-            except discord.NotFound:
-                print(f"[delete_previous_stale_message] Сообщение {message_id} уже удалено")
-            except discord.Forbidden:
-                print(f"[delete_previous_stale_message] Нет прав на удаление сообщения {message_id}")
-            except Exception as e:
-                print(f"[delete_previous_stale_message] Ошибка удаления {message_id}: {e}")
-    except Exception as e:
-        print(f"[delete_previous_stale_message] Ошибка получения канала: {e}")
-    
-    # Сбрасываем ID в БД (даже если не удалось удалить)
+
     db.execute(
         "UPDATE rows SET last_stale_message_id = 0 WHERE id = ?",
         (row_id,)
     )
+    db.commit()
+
+
+async def delete_row_notifications(*row_ids: int):
+    """
+    Удаляет все уведомления строк (просрочка и «завершил фарм»).
+    Вызывается перед очисткой/удалением строки — иначе в базе
+    ID обнулялся, а само сообщение оставалось в канале навсегда.
+    """
+    for row_id in row_ids:
+        row = db.execute(
+            "SELECT last_stale_message_id, finish_message_id FROM rows WHERE id = ?",
+            (row_id,)
+        ).fetchone()
+
+        if not row:
+            continue
+
+        await delete_bot_message(STALE_CHANNEL_ID, row["last_stale_message_id"])
+        await delete_bot_message(TABLE_CHANNEL_ID, row["finish_message_id"])
+
+        db.execute(
+            "UPDATE rows SET last_stale_message_id = 0, finish_message_id = 0 WHERE id = ?",
+            (row_id,)
+        )
+
     db.commit()
 
 
@@ -717,8 +761,8 @@ async def check_and_notify(row_id: int):
             return
 
         db.execute(
-            "UPDATE rows SET ping_sent = 1 WHERE id = ?",
-            (row_id,)
+            "UPDATE rows SET ping_sent = 1, finish_message_id = ? WHERE id = ?",
+            (msg.id, row_id)
         )
         db.commit()
         print("[check_and_notify] ping_sent установлен в 1, таблица обновлена.")
@@ -965,7 +1009,30 @@ async def deny(interaction: discord.Interaction):
         await interaction.response.send_message(text, ephemeral=True)
 
 
-async def update_table_messages():
+# Последний отправленный текст каждого сообщения таблицы:
+# неизменённые блоки не редактируем повторно.
+table_message_texts: dict[int, str] = {}
+
+# Чтобы две команды подряд не обновляли таблицу одновременно
+# (иначе могут появиться дубли сообщений).
+table_update_lock = asyncio.Lock()
+
+
+async def update_table_messages(force: bool = False):
+    """
+    Обновляет сообщения таблицы.
+
+    Раньше каждое обновление заново скачивало все сообщения таблицы
+    и переписывало каждый блок с паузой 1.5 с, поэтому команды
+    отвечали по несколько секунд. Теперь редактируются только
+    изменившиеся блоки, без лишних запросов и пауз
+    (лимиты Discord discord.py соблюдает сам).
+    """
+    async with table_update_lock:
+        await _update_table_messages(force)
+
+
+async def _update_table_messages(force: bool):
     channel = bot.get_channel(TABLE_CHANNEL_ID)
 
     if channel is None:
@@ -1003,91 +1070,98 @@ async def update_table_messages():
             "Недостаточно прав в канале: " + ", ".join(missing)
         )
 
-    all_blocks = blocks()
-    block_texts = []
+    block_texts = [
+        build_table_for_block(block["block_number"])
+        for block in blocks()
+    ]
 
-    for block in all_blocks:
-        text = build_table_for_block(block["block_number"])
-        block_texts.append(text)
+    message_ids = [
+        item["message_id"]
+        for item in db.execute(
+            """
+            SELECT message_id
+            FROM table_messages
+            ORDER BY position
+            """
+        ).fetchall()
+    ]
 
-    saved_messages = db.execute(
-        """
-        SELECT *
-        FROM table_messages
-        ORDER BY position
-        """
-    ).fetchall()
-
-    messages = []
-
-    for item in saved_messages:
-        try:
-            message = await channel.fetch_message(item["message_id"])
-            messages.append(message)
-        except discord.NotFound:
-            db.execute(
-                "DELETE FROM table_messages WHERE message_id = ?",
-                (item["message_id"],)
-            )
-        except discord.Forbidden:
-            print(
-                f"Нет доступа к сообщению {item['message_id']}. "
-                "Проверьте право чтения истории сообщений."
-            )
-
-    db.commit()
+    async def send_new(index: int, text: str) -> int:
+        message = await channel.send(content=text)
+        db.execute(
+            """
+            INSERT INTO table_messages(message_id, channel_id, position)
+            VALUES (?, ?, ?)
+            """,
+            (message.id, channel.id, index)
+        )
+        db.commit()
+        table_message_texts[message.id] = text
+        return message.id
 
     # Обновляем/создаём сообщения (по одному на блок)
     for index, text in enumerate(block_texts):
-        if index > 0:
-            await asyncio.sleep(1.5)
-        if index < len(messages):
-            try:
-                await messages[index].edit(content=text, embed=None)
-            except discord.HTTPException as e:
-                print(f"Не удалось обновить сообщение {messages[index].id}: {e}")
-                await messages[index].edit(content=text, embed=None)
-        else:
-            message = await channel.send(content=text, embed=None)
-            db.execute(
-                """
-                INSERT INTO table_messages(message_id, channel_id, position)
-                VALUES (?, ?, ?)
-                """,
-                (message.id, channel.id, index)
+        if index >= len(message_ids):
+            message_ids.append(await send_new(index, text))
+            continue
+
+        message_id = message_ids[index]
+
+        if not force and table_message_texts.get(message_id) == text:
+            continue
+
+        try:
+            await channel.get_partial_message(message_id).edit(
+                content=text,
+                embed=None
             )
+            table_message_texts[message_id] = text
+        except discord.NotFound:
+            # Сообщение таблицы удалили вручную — создаём заново
+            db.execute(
+                "DELETE FROM table_messages WHERE message_id = ?",
+                (message_id,)
+            )
+            db.commit()
+            table_message_texts.pop(message_id, None)
+            message_ids[index] = await send_new(index, text)
+        except discord.HTTPException as e:
+            print(f"Не удалось обновить сообщение {message_id}: {e}")
 
     # Удаляем лишние сообщения
-    await asyncio.sleep(1.5)
-    for i, message in enumerate(messages[len(block_texts):]):
-        if i > 0:
-            await asyncio.sleep(1.5)
+    for message_id in message_ids[len(block_texts):]:
         try:
-            await message.delete()
+            await channel.get_partial_message(message_id).delete()
         except discord.NotFound:
             pass
         except discord.Forbidden:
             print(
-                f"Бот не может удалить сообщение {message.id}. "
+                f"Бот не может удалить сообщение {message_id}. "
                 "Нужно право «Управление сообщениями»."
             )
         db.execute(
             "DELETE FROM table_messages WHERE message_id = ?",
-            (message.id,)
+            (message_id,)
         )
+        table_message_texts.pop(message_id, None)
 
     db.commit()
+
+
+async def delete_later(message, seconds: float):
+    await asyncio.sleep(seconds)
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 async def send_result(interaction: discord.Interaction, text: str):
     try:
         if interaction.response.is_done():
-            msg = await interaction.followup.send(text, ephemeral=True)
-            await asyncio.sleep(delay)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
+            msg = await interaction.followup.send(text[:2000], ephemeral=True, wait=True)
+            # Удаляем в фоне, чтобы команда не ждала 5 секунд
+            asyncio.create_task(delete_later(msg, delay))
         else:
             if len(text) <= 2000:
                 await interaction.response.send_message(text, ephemeral=True, delete_after=delay)
@@ -1321,6 +1395,8 @@ async def order_delete(
         await send_result(interaction, "Ошибка: указанная строка не существует.")
         return
 
+    await delete_row_notifications(target["id"])
+
     now_iso = datetime.now(timezone.utc).isoformat()
     db.execute(
         """
@@ -1393,6 +1469,8 @@ async def order_finish(
     player_name = target["player"]
     creator_id = target["created_by_id"] or ""
 
+    await delete_row_notifications(target["id"])
+
     db.execute(
         """
         UPDATE rows
@@ -1432,12 +1510,12 @@ async def order_finish(
         allowed_mentions=discord.AllowedMentions.all()
     )
 
-    await send_result(interaction, 
-        f"Заказ {row} завершён. Снято {total} {currency_name}. Остаток баланса: {new_total}.",
-        ephemeral=True
-    )
-
     await update_table_messages()
+
+    await send_result(
+        interaction,
+        f"Заказ {row} завершён. Снято {total} {currency_name}. Остаток баланса: {new_total}."
+    )
 
 
 @order_group.command(name="adjust", description="Изменить ручной баланс валюты")
@@ -1468,7 +1546,7 @@ async def order_adjust(
 
     if (target["currency"] or "coins") != currency:
         selected = "Gems" if (target["currency"] or "coins") == "gems" else "Coins"
-        await send_result(interaction, 
+        await send_result(interaction,
             f"Ошибка: в строке выбрана валюта {selected}."
         )
         return
@@ -1522,7 +1600,7 @@ async def order_adjust(
     await update_table_messages()
     await check_and_notify(target["id"])
 
-    await send_result(interaction, 
+    await send_result(interaction,
         f"Ручной баланс {currency} изменён: {current_adjust} -> {new_adjust} (изменение на {delta})."
     )
 
@@ -1761,10 +1839,12 @@ async def menu_del_row(
     )
 
     if filled and not confirm:
-        await send_result(interaction, 
+        await send_result(interaction,
             "Строка заполнена. Для удаления укажите confirm:true."
         )
         return
+
+    await delete_row_notifications(target["id"])
 
     try:
         delete_row(row)
@@ -1804,7 +1884,16 @@ async def menu_del_block(
 
     await interaction.response.defer(ephemeral=True)
 
+    block_row_ids = [
+        item["id"]
+        for item in db.execute(
+            "SELECT id FROM rows WHERE block_number = ?",
+            (block,)
+        ).fetchall()
+    ]
+
     try:
+        await delete_row_notifications(*block_row_ids)
         delete_block(block)
         await update_table_messages()
         await send_result(interaction, "Блок удалён.")
@@ -1856,7 +1945,7 @@ async def menu_edit_row(
         ).fetchone()["count"]
 
         if filled and not confirm:
-            await send_result(interaction, 
+            await send_result(interaction,
                 "Удаляемые строки заполнены. Повторите с confirm:true."
             )
             return
@@ -1904,7 +1993,7 @@ async def menu_refresh(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    await update_table_messages()
+    await update_table_messages(force=True)
     await send_result(interaction, "Таблица обновлена.")
 
 
@@ -1923,6 +2012,10 @@ async def menu_reset(
         )
 
     await interaction.response.defer(ephemeral=True)
+
+    await delete_row_notifications(
+        *(item["id"] for item in db.execute("SELECT id FROM rows").fetchall())
+    )
 
     db.execute("DELETE FROM rows")
     db.execute("DELETE FROM blocks")
@@ -1959,54 +2052,58 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if message.author.id != bot.user.id:
         return
 
-    stale_minutes = int(get_setting("stale_minutes") or "30")
-    stale_text = f"не обновлял{' монеты' if 'монеты' in message.content else ' гемы'} более {stale_minutes} минут"
-
-    # Проверяем, является ли сообщение одним из типов уведомлений
     content = message.content
-    if "завершил фарм" not in content and stale_text not in content:
+
+    # Раньше текст сверялся с текущей настройкой stale-time и словом
+    # «монеты»/«гемы»: после смены времени старые уведомления
+    # переставали распознаваться и не удалялись.
+    is_finish = "завершил фарм" in content
+    is_stale = re.search(r"не обновлял \w+ более \d+ минут", content) is not None
+
+    if not is_finish and not is_stale:
         return
 
-    ping_users_str = get_setting("global_ping_users") or ""
-    user_ids = ping_users_str.split()
-    if not user_ids:
+    # Удалять могут пингуемые пользователи и те, у кого есть
+    # «Управление сообщениями» (раньше при пустом списке пингов
+    # уведомления о просрочке не мог удалить никто).
+    user_ids = (get_setting("global_ping_users") or "").split()
+    member = payload.member
+    can_manage = (
+        member is not None
+        and hasattr(channel, "permissions_for")
+        and channel.permissions_for(member).manage_messages
+    )
+
+    if str(payload.user_id) not in user_ids and not can_manage:
         return
 
-    if str(payload.user_id) not in user_ids:
-        return
+    match = re.search(r"строка (\d+\.\d+)", content)
+    target = get_row(match.group(1)) if match else None
 
-    # Если это сообщение о завершении фарма - очищаем строку
-    if "завершил фарм" in content:
-        match = re.search(r"строка (\d+\.\d+)", content)
-        if match:
-            row_name = match.group(1)
-            target = get_row(row_name)
-            if target:
-                clear_row_by_id(target["id"])
-                print(f"Строка {row_name} очищена по реакции от {payload.user_id}")
-                await update_table_messages()
-            else:
-                print(f"Строка {row_name} не найдена, возможно уже удалена.")
-    
-    # Если это сообщение о просрочке - сбрасываем ID и удаляем сообщение
-    if stale_text in content:
-        # Ищем строку в сообщении
-        match = re.search(r"строка (\d+\.\d+)", content)
-        if match:
-            row_name = match.group(1)
-            target = get_row(row_name)
-            if target:
-                db.execute(
-                    "UPDATE rows SET last_stale_message_id = 0 WHERE id = ?",
-                    (target["id"],)
-                )
-                db.commit()
-                print(f"Сброшен ID уведомления для строки {row_name} по реакции от {payload.user_id}")
+    if is_finish:
+        if target:
+            # Заодно удаляем уведомление о просрочке этой строки
+            await delete_row_notifications(target["id"])
+            clear_row_by_id(target["id"])
+            print(f"Строка {match.group(1)} очищена по реакции от {payload.user_id}")
+            await update_table_messages()
+        else:
+            print("Строка из уведомления не найдена, возможно уже удалена.")
+
+    if is_stale and target and target["last_stale_message_id"] == message.id:
+        db.execute(
+            "UPDATE rows SET last_stale_message_id = 0 WHERE id = ?",
+            (target["id"],)
+        )
+        db.commit()
+        print(f"Сброшен ID уведомления для строки {match.group(1)} по реакции от {payload.user_id}")
 
     # Удаляем сообщение (для обоих типов)
     try:
         await message.delete()
         print(f"Сообщение удалено по реакции от {payload.user_id}")
+    except discord.NotFound:
+        pass
     except discord.Forbidden:
         print("Нет прав на удаление сообщения")
     except Exception as e:
