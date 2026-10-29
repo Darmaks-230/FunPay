@@ -2,9 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import io
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
+import aiohttp
 import discord
 
 from funpaybotengine import Router
@@ -48,6 +51,11 @@ DISCORD_WEBHOOK_AVATAR = os.getenv(
     "DISCORD_WEBHOOK_AVATAR",
     ""
 ).strip() or None
+
+# Картинки больше этого размера не скачиваем, а даём ссылкой
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+IMAGE_TEXT = "📷 Картинка"
 
 CHANNEL_DELETE_AFTER_DAYS = 3
 CHANNEL_CLEANUP_INTERVAL = 60 * 60
@@ -479,6 +487,87 @@ def get_chat_id(message: Message):
     return None
 
 
+def get_image_url(message: Message):
+    image_url = getattr(
+        message,
+        "image_url",
+        None
+    )
+
+    if not image_url:
+        return None
+
+    image_url = str(image_url).strip()
+
+    if image_url.startswith("//"):
+        return "https:" + image_url
+
+    if image_url.startswith("/"):
+        return "https://funpay.com" + image_url
+
+    return image_url
+
+
+async def download_image(image_url: str):
+    """
+    Скачивает картинку из чата FunPay и возвращает discord.File.
+
+    Картинку загружаем в Discord файлом, а не ссылкой: так она
+    не пропадёт, если ссылка FunPay перестанет открываться.
+    """
+
+    file_name = os.path.basename(
+        urlparse(image_url).path
+    )
+
+    file_name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        file_name
+    ) or "image.jpg"
+
+    if "." not in file_name:
+        file_name += ".jpg"
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.get(image_url) as response:
+                if response.status != 200:
+                    logging.warning(
+                        "Картинка не скачалась (HTTP %s): %s",
+                        response.status,
+                        image_url
+                    )
+                    return None
+
+                data = await response.content.read(
+                    IMAGE_MAX_BYTES + 1
+                )
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        logging.warning(
+            "Ошибка скачивания картинки %s: %s",
+            image_url,
+            error
+        )
+        return None
+
+    if len(data) > IMAGE_MAX_BYTES:
+        logging.info(
+            "Картинка больше %s МБ, отправляю ссылкой: %s",
+            IMAGE_MAX_BYTES // (1024 * 1024),
+            image_url
+        )
+        return None
+
+    return discord.File(
+        io.BytesIO(data),
+        filename=file_name
+    )
+
+
 def is_ignored_command_or_response(text: str) -> bool:
     """
     Не отправляет в Discord команды /info и /money,
@@ -845,7 +934,8 @@ async def send_to_user_channel(
     buyer_username,
     text: str,
     chat_id: str,
-    event_type: str
+    event_type: str,
+    image_url=None
 ):
     channel, webhook = await get_or_create_user_channel(
         chat_id=chat_id,
@@ -859,11 +949,33 @@ async def send_to_user_channel(
         event_type=event_type
     )
 
+    image_file = None
+
+    if image_url:
+        image_file = await download_image(
+            image_url
+        )
+
+        if image_file is not None:
+            embed.set_image(
+                url=f"attachment://{image_file.filename}"
+            )
+        else:
+            embed.set_image(
+                url=image_url
+            )
+
+    send_kwargs = {}
+
+    if image_file is not None:
+        send_kwargs["file"] = image_file
+
     await webhook.send(
         embed=embed,
         username=DISCORD_WEBHOOK_NAME,
         avatar_url=DISCORD_WEBHOOK_AVATAR,
-        wait=True
+        wait=True,
+        **send_kwargs
     )
 
     print(
@@ -1087,11 +1199,19 @@ async def handle_funpay_message(message: Message):
         )
         return
 
+    image_url = get_image_url(
+        message
+    )
+
     text = getattr(
         message,
         "text",
         None
-    ) or "[сообщение без текста]"
+    ) or (
+        IMAGE_TEXT
+        if image_url
+        else "[сообщение без текста]"
+    )
 
     text = str(text)
 
@@ -1143,7 +1263,8 @@ async def handle_funpay_message(message: Message):
             buyer_username=buyer_username,
             text=text,
             chat_id=chat_id,
-            event_type=event_type
+            event_type=event_type,
+            image_url=image_url
         )
 
         await send_to_events_channel(
