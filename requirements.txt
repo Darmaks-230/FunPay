@@ -1,0 +1,7 @@
+discord.py>=2.3.2
+python-dotenv>=1.0.0
+
+aiohttp>=3.9.1
+selectolax>=0.3.0
+funpayparsers>=0.10.1
+funpaybotengine>=0.7.1

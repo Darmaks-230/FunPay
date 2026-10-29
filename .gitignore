@@ -1,0 +1,22 @@
+# Секреты
+.env
+
+# Данные покупателей и вебхуки Discord
+orders.sqlite3
+*.sqlite3
+funpay_channels.json
+funpay_channels.tmp
+
+# Логи
+logs/
+*.log
+
+# Окружение и кэш
+venv/
+__pycache__/
+*.pyc
+.vscode/
+
+# Личные файлы
+main(save)
+*.png
