@@ -1,7 +1,10 @@
 import os
 import re
 import sqlite3
+import contextvars
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 import asyncio
 
@@ -18,7 +21,11 @@ TABLE_CHANNEL_ID = int(os.getenv("TABLE_CHANNEL_ID", "0"))
 ORDER_ROLE_ID = int(os.getenv("ORDER_ROLE_ID", "0"))
 STALE_CHANNEL_ID = int(os.getenv("STALE_CHANNEL_ID", "0"))  # Новый канал для уведомлений о просрочке
 
-DB_FILE = "orders.sqlite3"
+BASE_DIR = Path(__file__).resolve().parent
+
+# База основного сервера (того, где канал TABLE_CHANNEL_ID).
+# У остальных серверов свои файлы orders_<id сервера>.sqlite3.
+DB_FILE = str(BASE_DIR / "orders.sqlite3")
 MAX_DISCORD_LENGTH = 2000
 DEFAULT_BLOCKS = [3, 3, 3]
 IMAGE_FILE_PATH = "itogiconkursa.png"
@@ -30,8 +37,117 @@ delay = 5
 # База данных
 # -----------------------------
 
-db = sqlite3.connect(DB_FILE)
-db.row_factory = sqlite3.Row
+# -----------------------------
+# Свои таблицы на каждом сервере
+# -----------------------------
+#
+# Раньше база и канал таблицы были одни на всех: команда на любом
+# сервере меняла таблицу там, где лежит TABLE_CHANNEL_ID.
+# Теперь у каждого сервера свой файл базы. Код ниже по-прежнему
+# пишет просто db.execute(...), а запрос уходит в базу того сервера,
+# с которым сейчас идёт работа (current_guild_id). Его выставляют
+# команды, реакции, сообщения Match Won и фоновая проверка.
+
+current_guild_id: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "current_guild_id",
+    default=None
+)
+
+_connections: dict[str, sqlite3.Connection] = {}
+
+
+def _read_main_guild_id() -> Optional[int]:
+    if not os.path.exists(DB_FILE):
+        return None
+
+    connection = sqlite3.connect(DB_FILE)
+    try:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = 'guild_id'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        connection.close()
+
+    return int(row[0]) if row and row[0] else None
+
+
+# Сервер, которому принадлежит orders.sqlite3 (определяется в on_ready)
+MAIN_GUILD_ID: Optional[int] = _read_main_guild_id()
+
+
+def is_main_guild(guild_id: Optional[int] = None) -> bool:
+    if guild_id is None:
+        guild_id = current_guild_id.get()
+
+    return guild_id is None or guild_id == MAIN_GUILD_ID
+
+
+def database_path(guild_id: Optional[int]) -> str:
+    if is_main_guild(guild_id):
+        return DB_FILE
+
+    return str(BASE_DIR / f"orders_{guild_id}.sqlite3")
+
+
+def known_guild_ids() -> list[int]:
+    """Серверы, у которых уже есть своя таблица."""
+    result = []
+
+    if MAIN_GUILD_ID:
+        result.append(MAIN_GUILD_ID)
+
+    for path in BASE_DIR.glob("orders_*.sqlite3"):
+        match = re.fullmatch(r"orders_(\d+)\.sqlite3", path.name)
+        if match and int(match.group(1)) not in result:
+            result.append(int(match.group(1)))
+
+    return result
+
+
+@contextmanager
+def use_guild(guild_id: Optional[int]):
+    token = current_guild_id.set(guild_id)
+    try:
+        yield
+    finally:
+        current_guild_id.reset(token)
+
+
+def get_connection(guild_id: Optional[int]) -> sqlite3.Connection:
+    path = database_path(guild_id)
+
+    if path not in _connections:
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        _connections[path] = connection
+
+        # Новая база сервера: создаём таблицы и стандартные блоки
+        with use_guild(guild_id):
+            init_db()
+            initialize_table()
+
+    return _connections[path]
+
+
+class GuildDatabase:
+    """db.execute(...) идёт в базу текущего сервера."""
+
+    def connection(self) -> sqlite3.Connection:
+        return get_connection(current_guild_id.get())
+
+    def execute(self, *args):
+        return self.connection().execute(*args)
+
+    def executescript(self, script: str):
+        return self.connection().executescript(script)
+
+    def commit(self):
+        self.connection().commit()
+
+
+db = GuildDatabase()
 
 
 def init_db():
@@ -129,6 +245,27 @@ def set_setting(key: str, value: str):
         (key, value)
     )
     db.commit()
+
+
+def guild_setting_int(key: str, main_default: int) -> int:
+    value = get_setting(key)
+
+    if value:
+        return int(value)
+
+    return main_default if is_main_guild() else 0
+
+
+def table_channel_id() -> int:
+    return guild_setting_int("table_channel_id", TABLE_CHANNEL_ID)
+
+
+def stale_channel_id() -> int:
+    return guild_setting_int("stale_channel_id", STALE_CHANNEL_ID)
+
+
+def order_role_id() -> int:
+    return guild_setting_int("order_role_id", ORDER_ROLE_ID)
 
 
 def initialize_table():
@@ -660,7 +797,7 @@ async def delete_previous_stale_message(row_id: int):
     if not row or not row["last_stale_message_id"]:
         return
 
-    deleted = await delete_bot_message(STALE_CHANNEL_ID, row["last_stale_message_id"])
+    deleted = await delete_bot_message(stale_channel_id(), row["last_stale_message_id"])
 
     if not deleted:
         # ID оставляем: следующая проверка (каждые 5 минут) попробует снова
@@ -688,8 +825,8 @@ async def delete_row_notifications(*row_ids: int):
         if not row:
             continue
 
-        await delete_bot_message(STALE_CHANNEL_ID, row["last_stale_message_id"])
-        await delete_bot_message(TABLE_CHANNEL_ID, row["finish_message_id"])
+        await delete_bot_message(stale_channel_id(), row["last_stale_message_id"])
+        await delete_bot_message(table_channel_id(), row["finish_message_id"])
 
         db.execute(
             "UPDATE rows SET last_stale_message_id = 0, finish_message_id = 0 WHERE id = ?",
@@ -739,10 +876,10 @@ async def check_and_notify(row_id: int):
             print("[check_and_notify] Список пингов пуст, уведомление не отправлено.")
             return
 
-        channel = bot.get_channel(TABLE_CHANNEL_ID)
+        channel = bot.get_channel(table_channel_id())
         if channel is None:
             try:
-                channel = await bot.fetch_channel(TABLE_CHANNEL_ID)
+                channel = await bot.fetch_channel(table_channel_id())
             except:
                 print("[check_and_notify] Не удалось получить канал для уведомления")
                 return
@@ -817,8 +954,8 @@ async def check_stale_updates():
             await delete_previous_stale_message(row["id"])
             
             # Проверяем, указан ли канал для просрочек
-            if not STALE_CHANNEL_ID:
-                print("[check_stale_updates] STALE_CHANNEL_ID не указан в .env, уведомление не отправлено")
+            if not stale_channel_id():
+                print("[check_stale_updates] Канал просрочек на сервере не задан (/menu set-stale-channel)")
                 continue
             
             ping_users_str = get_setting("global_ping_users") or ""
@@ -842,10 +979,10 @@ async def check_stale_updates():
                 f"Пожалуйста, обновите данные!"
             )
 
-            channel = bot.get_channel(STALE_CHANNEL_ID)
+            channel = bot.get_channel(stale_channel_id())
             if channel is None:
                 try:
-                    channel = await bot.fetch_channel(STALE_CHANNEL_ID)
+                    channel = await bot.fetch_channel(stale_channel_id())
                 except Exception as e:
                     print(f"[check_stale_updates] Не удалось получить канал просрочек: {e}")
                     continue
@@ -882,15 +1019,28 @@ async def update_coins_from_match(message: discord.Message):
 
     player, coins, gems = result
 
-    row = db.execute(
-        """
-        SELECT *
-        FROM rows
-        WHERE LOWER(player) = LOWER(?)
-        LIMIT 1
-        """,
-        (player,)
-    ).fetchone()
+    # Сначала таблица сервера, где пришло сообщение, потом остальные
+    guild_ids = known_guild_ids()
+    if message.guild and message.guild.id in guild_ids:
+        guild_ids.remove(message.guild.id)
+        guild_ids.insert(0, message.guild.id)
+
+    row = None
+
+    for guild_id in guild_ids:
+        current_guild_id.set(guild_id)
+        row = db.execute(
+            """
+            SELECT *
+            FROM rows
+            WHERE LOWER(player) = LOWER(?)
+            LIMIT 1
+            """,
+            (player,)
+        ).fetchone()
+
+        if row:
+            break
 
     if not row:
         print(
@@ -994,10 +1144,12 @@ def can_use_order(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
         return True
 
-    if not ORDER_ROLE_ID:
+    role_id = order_role_id()
+
+    if not role_id:
         return False
 
-    return any(role.id == ORDER_ROLE_ID for role in interaction.user.roles)
+    return any(role.id == role_id for role in interaction.user.roles)
 
 
 async def deny(interaction: discord.Interaction):
@@ -1033,23 +1185,40 @@ async def update_table_messages(force: bool = False):
 
 
 async def _update_table_messages(force: bool):
-    channel = bot.get_channel(TABLE_CHANNEL_ID)
+    channel_id = table_channel_id()
+
+    if not channel_id:
+        raise RuntimeError(
+            "На этом сервере не выбран канал таблицы. "
+            "Выполните /menu set-channel в нужном канале."
+        )
+
+    channel = bot.get_channel(channel_id)
 
     if channel is None:
         try:
-            channel = await bot.fetch_channel(TABLE_CHANNEL_ID)
+            channel = await bot.fetch_channel(channel_id)
         except discord.NotFound:
             raise RuntimeError(
-                "Канал с указанным TABLE_CHANNEL_ID не существует."
+                "Канал таблицы не существует. Выберите новый: /menu set-channel."
             )
         except discord.Forbidden:
             raise RuntimeError(
-                "Бот не имеет доступа к каналу TABLE_CHANNEL_ID."
+                "Бот не имеет доступа к каналу таблицы."
             )
 
     if not isinstance(channel, discord.TextChannel):
         raise RuntimeError(
-            "TABLE_CHANNEL_ID должен указывать на текстовый канал."
+            "Канал таблицы должен быть текстовым."
+        )
+
+    guild_id = current_guild_id.get()
+
+    if guild_id is not None and channel.guild.id != guild_id:
+        # Защита: таблица сервера никогда не пишется в канал другого сервера
+        raise RuntimeError(
+            "Канал таблицы находится на другом сервере. "
+            "Выполните /menu set-channel в канале этого сервера."
         )
 
     permissions = channel.permissions_for(channel.guild.me)
@@ -1977,7 +2146,9 @@ async def menu_show(interaction: discord.Interaction):
     text = (
         f"Блоков: {block_count}\n"
         f"Строк: {row_count}\n"
-        f"Канал таблицы: {TABLE_CHANNEL_ID}\n"
+        f"Канал таблицы: <#{table_channel_id()}>\n"
+        f"Канал просрочек: <#{stale_channel_id()}>\n"
+        f"Роль для /order: {order_role_id() or '(только админы)'}\n"
         f"Сообщений таблицы: {db.execute('SELECT COUNT(*) AS count FROM table_messages').fetchone()['count']}\n"
         f"Пользователи для пинга: {ping_users}\n"
         f"Время уведомления: {stale_minutes} минут"
@@ -2026,7 +2197,74 @@ async def menu_reset(
     await send_result(interaction, "Таблица сброшена.")
 
 
+@menu_group.command(name="set-channel", description="Сделать этот канал каналом таблицы на этом сервере")
+async def menu_set_channel(interaction: discord.Interaction):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Удаляем сообщения таблицы из старого канала
+    old_channel_id = table_channel_id()
+    for item in db.execute("SELECT message_id FROM table_messages").fetchall():
+        if old_channel_id and old_channel_id != interaction.channel_id:
+            await delete_bot_message(old_channel_id, item["message_id"])
+        table_message_texts.pop(item["message_id"], None)
+
+    db.execute("DELETE FROM table_messages")
+    set_setting("table_channel_id", str(interaction.channel_id))
+
+    await update_table_messages(force=True)
+    await send_result(interaction, "Теперь таблица этого сервера в этом канале.")
+
+
+@menu_group.command(name="set-stale-channel", description="Сделать этот канал каналом уведомлений о просрочке")
+async def menu_set_stale_channel(interaction: discord.Interaction):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    set_setting("stale_channel_id", str(interaction.channel_id))
+    await send_result(interaction, "Уведомления о просрочке будут приходить в этот канал.")
+
+
+@menu_group.command(name="set-role", description="Роль, которой разрешены команды /order на этом сервере")
+@app_commands.describe(role="Роль для команд /order")
+async def menu_set_role(interaction: discord.Interaction, role: discord.Role):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    set_setting("order_role_id", str(role.id))
+    await send_result(interaction, f"Команды /order доступны роли {role.mention}.")
+
+
 bot.tree.add_command(menu_group)
+
+
+async def set_interaction_guild(interaction: discord.Interaction) -> bool:
+    """Каждая команда работает с таблицей своего сервера."""
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Команды работают только на сервере.",
+            ephemeral=True
+        )
+        return False
+
+    current_guild_id.set(interaction.guild_id)
+    return True
+
+
+async def on_command_error(interaction: discord.Interaction, error: Exception):
+    original = getattr(error, "original", error)
+    print(f"Ошибка команды: {original!r}")
+
+    try:
+        await send_result(interaction, f"Ошибка: {original}")
+    except Exception:
+        pass
+
+
+bot.tree.interaction_check = set_interaction_guild
+bot.tree.on_error = on_command_error
 
 
 # -----------------------------
@@ -2037,6 +2275,11 @@ bot.tree.add_command(menu_group)
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id:
         return
+
+    if payload.guild_id is None or payload.guild_id not in known_guild_ids():
+        return
+
+    current_guild_id.set(payload.guild_id)
 
     if str(payload.emoji) != "✅":
         return
@@ -2117,10 +2360,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 async def stale_check_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
-        try:
-            await check_stale_updates()
-        except Exception as e:
-            print(f"[stale_check_loop] Ошибка: {e}")
+        for guild_id in known_guild_ids():
+            try:
+                with use_guild(guild_id):
+                    await check_stale_updates()
+            except Exception as e:
+                print(f"[stale_check_loop] Ошибка (сервер {guild_id}): {e}")
         await asyncio.sleep(300)  # проверка каждые 10 минут
 
 
@@ -2168,7 +2413,15 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_ready():
-    initialize_table()
+    global MAIN_GUILD_ID
+
+    table_channel = bot.get_channel(TABLE_CHANNEL_ID)
+
+    if table_channel is not None and MAIN_GUILD_ID != table_channel.guild.id:
+        MAIN_GUILD_ID = table_channel.guild.id
+        with use_guild(None):
+            set_setting("guild_id", str(MAIN_GUILD_ID))
+        print(f"Основной сервер таблицы: {table_channel.guild.name} ({MAIN_GUILD_ID})")
 
     print(f"Бот запущен: {bot.user}")
     print(f"TABLE_CHANNEL_ID: {TABLE_CHANNEL_ID}")
@@ -2214,10 +2467,12 @@ async def on_ready():
     except Exception as error:
         print(f"Ошибка синхронизации команд: {error}")
 
-    try:
-        await update_table_messages()
-    except Exception as error:
-        print(f"Ошибка обновления таблицы: {error}")
+    for guild_id in known_guild_ids():
+        try:
+            with use_guild(guild_id):
+                await update_table_messages()
+        except Exception as error:
+            print(f"Ошибка обновления таблицы (сервер {guild_id}): {error}")
 
     # Запускаем фоновую проверку устаревших монет
     bot.loop.create_task(stale_check_loop())

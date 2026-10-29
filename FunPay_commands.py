@@ -43,12 +43,38 @@ router = Router(name="commands")
 # Подготовка базы данных
 # =================================================
 
-def prepare_database():
+# Базы, в которых уже добавлены нужные столбцы
+_prepared_paths: set[Path] = set()
+
+
+def database_paths() -> list[Path]:
+    """
+    Базы таблиц всех серверов Discord: orders.sqlite3 основного
+    сервера и orders_<id сервера>.sqlite3 остальных (см. main.py).
+    """
+
+    paths = [DATABASE_PATH] + sorted(BASE_DIR.glob("orders_*.sqlite3"))
+
+    for path in paths:
+        if path in _prepared_paths:
+            continue
+
+        try:
+            prepare_database(path)
+            _prepared_paths.add(path)
+        except sqlite3.Error as error:
+            # Базу нового сервера main.py может ещё создавать
+            logging.warning("База %s пока не готова: %s", path.name, error)
+
+    return [path for path in paths if path in _prepared_paths]
+
+
+def prepare_database(database_path: Path = DATABASE_PATH):
     """
     Добавляет дополнительные столбцы в таблицу rows.
     """
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with sqlite3.connect(database_path) as connection:
         cursor = connection.cursor()
 
         columns = {
@@ -136,22 +162,26 @@ def save_chat_id(player_name: str, chat_id: str) -> bool:
     """
 
     try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            cursor = connection.cursor()
+        updated = 0
 
-            cursor.execute(
-                """
-                UPDATE rows
-                SET chat_id = ?,
-                    farm_finished = 0
-                WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
-                """,
-                (str(chat_id), player_name)
-            )
+        for database_path in database_paths():
+            with sqlite3.connect(database_path) as connection:
+                cursor = connection.cursor()
 
-            connection.commit()
+                cursor.execute(
+                    """
+                    UPDATE rows
+                    SET chat_id = ?,
+                        farm_finished = 0
+                    WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
+                    """,
+                    (str(chat_id), player_name)
+                )
 
-            return cursor.rowcount > 0
+                connection.commit()
+                updated += cursor.rowcount
+
+        return updated > 0
 
     except sqlite3.Error as error:
         logging.error(
@@ -166,49 +196,48 @@ def save_chat_id(player_name: str, chat_id: str) -> bool:
 # =================================================
 
 def get_account_data(player_name: str) -> dict | None:
-    try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.row_factory = sqlite3.Row
+    """Ищет игрока в таблицах всех серверов."""
 
-            cursor = connection.cursor()
+    for database_path in database_paths():
+        try:
+            with sqlite3.connect(database_path) as connection:
+                connection.row_factory = sqlite3.Row
 
-            cursor.execute(
-                """
-                SELECT
-                    id,
-                    player,
-                    account_coins,
-                    adjust_coins,
-                    before_coins,
-                    paid_coins,
-                    account_gems,
-                    adjust_gems,
-                    before_gems,
-                    paid_gems,
-                    currency,
-                    chat_id,
-                    farm_finished
-                FROM rows
-                WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (player_name,)
+                result = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        player,
+                        account_coins,
+                        adjust_coins,
+                        before_coins,
+                        paid_coins,
+                        account_gems,
+                        adjust_gems,
+                        before_gems,
+                        paid_gems,
+                        currency,
+                        chat_id,
+                        farm_finished
+                    FROM rows
+                    WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (player_name,)
+                ).fetchone()
+
+                if result is not None:
+                    return dict(result)
+
+        except sqlite3.Error as error:
+            logging.error(
+                "Ошибка чтения базы %s: %s",
+                database_path.name,
+                error
             )
 
-            result = cursor.fetchone()
-
-            if result is None:
-                return None
-
-            return dict(result)
-
-    except sqlite3.Error as error:
-        logging.error(
-            "Ошибка чтения базы данных: %s",
-            error
-        )
-        return None
+    return None
 
 
 # =================================================
@@ -447,50 +476,53 @@ async def help_command(message: Message):
 # =================================================
 
 def get_active_orders() -> list[dict]:
-    try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.row_factory = sqlite3.Row
+    orders = []
 
-            cursor = connection.cursor()
+    for database_path in database_paths():
+        try:
+            with sqlite3.connect(database_path) as connection:
+                connection.row_factory = sqlite3.Row
 
-            cursor.execute(
-                """
-                SELECT
-                    id,
-                    player,
-                    account_coins,
-                    adjust_coins,
-                    before_coins,
-                    paid_coins,
-                    account_gems,
-                    adjust_gems,
-                    before_gems,
-                    paid_gems,
-                    currency,
-                    chat_id,
-                    farm_finished
-                FROM rows
-                WHERE chat_id IS NOT NULL
-                  AND TRIM(chat_id) != ''
-                  AND COALESCE(farm_finished, 0) = 0
-                """
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        player,
+                        account_coins,
+                        adjust_coins,
+                        before_coins,
+                        paid_coins,
+                        account_gems,
+                        adjust_gems,
+                        before_gems,
+                        paid_gems,
+                        currency,
+                        chat_id,
+                        farm_finished
+                    FROM rows
+                    WHERE chat_id IS NOT NULL
+                      AND TRIM(chat_id) != ''
+                      AND COALESCE(farm_finished, 0) = 0
+                    """
+                ).fetchall()
+
+            for row in rows:
+                order = dict(row)
+                order["database_path"] = database_path
+                orders.append(order)
+
+        except sqlite3.Error as error:
+            logging.error(
+                "Ошибка получения активных заказов из %s: %s",
+                database_path.name,
+                error
             )
 
-            return [
-                dict(row)
-                for row in cursor.fetchall()
-            ]
-
-    except sqlite3.Error as error:
-        logging.error(
-            "Ошибка получения активных заказов: %s",
-            error
-        )
-        return []
+    return orders
 
 
-def mark_farm_finished(row_id: int):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+def mark_farm_finished(row_id: int, database_path: Path = DATABASE_PATH):
+    with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
             UPDATE rows
@@ -544,7 +576,10 @@ async def farm_checker():
                     try:
                         await send_completion_message(order)
 
-                        mark_farm_finished(order["id"])
+                        mark_farm_finished(
+                            order["id"],
+                            order["database_path"]
+                        )
 
                         logging.info(
                             "Уведомление отправлено игроку %s",
@@ -579,7 +614,10 @@ def setup():
     logging.info("🚀 Команды FunPay запускаются")
     logging.info("📁 База данных: %s", DATABASE_PATH)
 
-    prepare_database()
+    logging.info(
+        "📁 Таблиц серверов: %s",
+        len(database_paths())
+    )
 
     with sqlite3.connect(DATABASE_PATH) as connection:
         cursor = connection.cursor()
