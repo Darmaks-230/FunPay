@@ -8,6 +8,7 @@ from funpaybotengine import Router
 from funpaybotengine.types import Message
 
 from funpay_shared import bot, dispatcher
+from FunPay_sales import CREATE_FINISHED_ORDERS, set_pending_player
 
 
 # =================================================
@@ -76,6 +77,9 @@ def prepare_database(database_path: Path = DATABASE_PATH):
 
     with sqlite3.connect(database_path) as connection:
         cursor = connection.cursor()
+
+        # Записи о нафармивших аккаунтах (их создаёт main.py)
+        cursor.execute(CREATE_FINISHED_ORDERS)
 
         columns = {
             row[1]
@@ -316,6 +320,9 @@ async def money_command(message: Message):
         chat_id = get_chat_id_from_message(message)
 
         if chat_id is not None:
+            # Ник появится в карточке продажи в Discord
+            set_pending_player(chat_id, player_name)
+
             saved = save_chat_id(player_name, chat_id)
 
             if saved:
@@ -382,6 +389,9 @@ async def info_command(message: Message):
         chat_id = get_chat_id_from_message(message)
 
         if chat_id is not None:
+            # Ник появится в карточке продажи в Discord
+            set_pending_player(chat_id, player_name)
+
             saved = save_chat_id(player_name, chat_id)
 
             if saved:
@@ -539,22 +549,95 @@ def mark_farm_finished(row_id: int, database_path: Path = DATABASE_PATH):
 # Отправка сообщения о завершении
 # =================================================
 
-async def send_completion_message(order: dict):
-    total, goal, progress, currency = calculate_progress(order)
-    chat_id = order["chat_id"]
+def completion_text(player: str, total, goal, progress: int, currency: str) -> str:
     icon = "💎" if currency == "gems" else "💰"
     name = "гемов" if currency == "gems" else "монет"
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"✅ Фарм игрока {order['player']} закончен!\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{icon} Получено {name}: {total:,}\n"
-            f"🎯 Цель: {goal:,}\n"
-            f"📊 Прогресс: {progress}%"
-        )
+    return (
+        f"✅ Фарм игрока {player} закончен!\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} Получено {name}: {total:,}\n"
+        f"🎯 Цель: {goal:,}\n"
+        f"📊 Прогресс: {progress}%"
     )
+
+
+async def send_completion_message(order: dict):
+    total, goal, progress, currency = calculate_progress(order)
+
+    await bot.send_message(
+        chat_id=order["chat_id"],
+        text=completion_text(order["player"], total, goal, progress, currency)
+    )
+
+
+def get_unnotified_finished_orders() -> list[dict]:
+    """
+    Аккаунты, которые нафармили: main.py сразу убирает их из таблицы,
+    поэтому сообщение покупателю берём из finished_orders.
+    """
+
+    notices = []
+
+    for database_path in database_paths():
+        try:
+            with sqlite3.connect(database_path) as connection:
+                connection.row_factory = sqlite3.Row
+
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM finished_orders
+                    WHERE buyer_notified = 0
+                      AND TRIM(chat_id) != ''
+                    """
+                ).fetchall()
+
+            for row in rows:
+                notice = dict(row)
+                notice["database_path"] = database_path
+                notices.append(notice)
+
+        except sqlite3.Error as error:
+            logging.error(
+                "Ошибка чтения finished_orders из %s: %s",
+                database_path.name,
+                error
+            )
+
+    return notices
+
+
+async def notify_finished_orders():
+    for notice in get_unnotified_finished_orders():
+        try:
+            await bot.send_message(
+                chat_id=notice["chat_id"],
+                text=completion_text(
+                    notice["player"],
+                    int(round(notice["balance"])),
+                    int(round(notice["goal"])),
+                    100,
+                    notice["currency"]
+                )
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось отправить уведомление игроку %s",
+                notice["player"]
+            )
+            continue
+
+        with sqlite3.connect(notice["database_path"]) as connection:
+            connection.execute(
+                "UPDATE finished_orders SET buyer_notified = 1 WHERE id = ?",
+                (notice["id"],)
+            )
+
+        logging.info(
+            "Уведомление о конце фарма отправлено игроку %s",
+            notice["player"]
+        )
 
 
 # =================================================
@@ -592,6 +675,8 @@ async def farm_checker():
                             "игроку %s",
                             order["player"]
                         )
+
+            await notify_finished_orders()
 
         except Exception:
             logging.exception(

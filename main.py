@@ -13,6 +13,13 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from FunPay_sales import (
+    CREATE_CLOSED_ORDERS,
+    CREATE_FINISHED_ORDERS,
+    CREATE_PENDING_SALES,
+    order_id_from_link,
+)
+
 
 load_dotenv()
 
@@ -192,6 +199,9 @@ def init_db():
         );
         """
     )
+    db.execute(CREATE_PENDING_SALES)
+    db.execute(CREATE_CLOSED_ORDERS)
+    db.execute(CREATE_FINISHED_ORDERS)
     db.commit()
 
     # Проверяем и добавляем отсутствующие колонки
@@ -211,6 +221,8 @@ def init_db():
         "ping_sent": "INTEGER DEFAULT 0",
         "last_stale_message_id": "INTEGER DEFAULT 0",
         "finish_message_id": "INTEGER DEFAULT 0",
+        "chat_id": "TEXT",
+        "farm_finished": "INTEGER DEFAULT 0",
         "mark": "TEXT DEFAULT ''",
     }
 
@@ -720,7 +732,7 @@ def parse_match_won(message: discord.Message):
     return player.strip(), coins, gems
 
 
-def clear_row_by_id(row_id: int):
+def clear_row_by_id(row_id: int, reason: str = "Очистка по реакции ✅"):
     """Очищает строку (сбрасывает все поля)"""
     now_iso = datetime.now(timezone.utc).isoformat()
     db.execute(
@@ -745,10 +757,12 @@ def clear_row_by_id(row_id: int):
             ping_sent = 0,
             last_stale_message_id = 0,
             finish_message_id = 0,
+            chat_id = '',
+            farm_finished = 0,
             mark = ''
         WHERE id = ?
         """,
-        (now_iso, "Очистка по реакции ✅", now_iso, row_id)
+        (now_iso, reason, now_iso, row_id)
     )
     db.commit()
 
@@ -868,44 +882,154 @@ async def check_and_notify(row_id: int):
     print(f"[check_and_notify] total_balance (account+adjust) = {total_balance}, ping_sent = {ping_sent}")
 
     if total_balance >= total and ping_sent == 0:
-        print("[check_and_notify] УСЛОВИЕ ВЫПОЛНЕНО! Отправляем уведомление.")
-
-        ping_users_str = get_setting("global_ping_users") or ""
-        user_ids = ping_users_str.split()
-        if not user_ids:
-            print("[check_and_notify] Список пингов пуст, уведомление не отправлено.")
-            return
-
-        channel = bot.get_channel(table_channel_id())
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(table_channel_id())
-            except:
-                print("[check_and_notify] Не удалось получить канал для уведомления")
-                return
-
-        mentions = " ".join(f"<@{uid}>" for uid in user_ids if uid)
-        player_name = row["player"] or "Игрок"
-        row_str = f"{row['block_number']}.{row['row_number']}"
-        message_text = f"{mentions} {player_name} (строка {row_str}) завершил фарм!" if mentions else f"{player_name} (строка {row_str}) завершил фарм!"
-
-        try:
-            msg = await channel.send(message_text, allowed_mentions=discord.AllowedMentions.all())
-            await msg.add_reaction("✅")
-            print("[check_and_notify] Уведомление отправлено, реакция добавлена.")
-        except Exception as e:
-            print(f"[check_and_notify] Ошибка отправки уведомления: {e}")
-            return
-
-        db.execute(
-            "UPDATE rows SET ping_sent = 1, finish_message_id = ? WHERE id = ?",
-            (msg.id, row_id)
-        )
-        db.commit()
-        print("[check_and_notify] ping_sent установлен в 1, таблица обновлена.")
-        await update_table_messages()
+        print("[check_and_notify] УСЛОВИЕ ВЫПОЛНЕНО! Освобождаем строку и отправляем уведомление.")
+        await finish_farm(row, total_balance, total, currency_name)
     else:
         print("[check_and_notify] Условие НЕ выполнено, уведомление НЕ отправлено.")
+
+
+def format_big(value) -> str:
+    value = float(value)
+    text = f"{int(value):,}" if value.is_integer() else f"{value:,.2f}"
+    return text.replace(",", " ")
+
+
+async def finish_farm(row, total_balance, total, currency_name: str):
+    """
+    Аккаунт нафармил: пишем об этом и сразу убираем его из таблицы.
+    Сообщение удалится само, когда покупатель подтвердит заказ на FunPay
+    (см. process_closed_orders), или вручную реакцией ✅.
+    """
+    channel = bot.get_channel(table_channel_id())
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(table_channel_id())
+        except Exception:
+            print("[finish_farm] Не удалось получить канал для уведомления")
+            return
+
+    user_ids = (get_setting("global_ping_users") or "").split()
+    mentions = " ".join(f"<@{uid}>" for uid in user_ids if uid)
+
+    player_name = row["player"] or "Игрок"
+    row_str = f"{row['block_number']}.{row['row_number']}"
+    link = row["link"] or ""
+    order_id = order_id_from_link(link)
+
+    lines = [
+        f"{mentions} ✅ {player_name} (строка {row_str}) завершил фарм!".strip(),
+        f"Нафармлено: {format_big(total_balance)} из {format_big(total)} {currency_name}.",
+        "Аккаунт убран из таблицы, строка свободна.",
+    ]
+
+    if link:
+        lines.append(f"Заказ: <{link}>")
+
+    if order_id:
+        lines.append("Сообщение удалится, когда покупатель подтвердит заказ.")
+
+    try:
+        msg = await channel.send(
+            "\n".join(lines),
+            allowed_mentions=discord.AllowedMentions.all()
+        )
+        await msg.add_reaction("✅")
+    except Exception as e:
+        print(f"[finish_farm] Ошибка отправки уведомления: {e}")
+        return
+
+    db.execute(
+        """
+        INSERT INTO finished_orders(
+            order_id, player, row_name, currency, balance, goal,
+            chat_id, channel_id, message_id, buyer_notified, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            order_id,
+            player_name,
+            row_str,
+            row["currency"] or "coins",
+            total_balance,
+            total,
+            row["chat_id"] or "",
+            channel.id,
+            msg.id,
+            # Если FunPay-бот уже успел написать покупателю — второй раз не пишем
+            row["farm_finished"] or 0,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+    db.commit()
+
+    await delete_row_notifications(row["id"])
+    clear_row_by_id(row["id"], "Фарм завершён")
+    print(f"[finish_farm] Строка {row_str} освобождена: {player_name} нафармил.")
+
+    await update_table_messages()
+
+
+async def process_closed_orders():
+    """
+    Покупатель подтвердил заказ на FunPay (FunPay_sales.py кладёт его
+    в closed_orders): убираем аккаунт из таблицы, если он ещё там,
+    и удаляем сообщение «завершил фарм».
+    """
+    with use_guild(None):
+        closed = db.execute(
+            "SELECT order_id FROM closed_orders WHERE processed = 0"
+        ).fetchall()
+
+    for item in closed:
+        order_id = item["order_id"]
+
+        for guild_id in known_guild_ids():
+            with use_guild(guild_id):
+                rows = db.execute(
+                    """
+                    SELECT *
+                    FROM rows
+                    WHERE link LIKE ? OR link LIKE ?
+                    """,
+                    (f"%/orders/{order_id}/%", f"%/orders/{order_id}")
+                ).fetchall()
+
+                for row in rows:
+                    await delete_row_notifications(row["id"])
+                    clear_row_by_id(row["id"], "Заказ подтверждён покупателем")
+                    print(
+                        f"[closed_orders] Заказ #{order_id} подтверждён: "
+                        f"строка {row['block_number']}.{row['row_number']} очищена"
+                    )
+
+                notices = db.execute(
+                    "SELECT * FROM finished_orders WHERE order_id = ?",
+                    (order_id,)
+                ).fetchall()
+
+                for notice in notices:
+                    await delete_bot_message(notice["channel_id"], notice["message_id"])
+                    db.execute(
+                        "DELETE FROM finished_orders WHERE id = ?",
+                        (notice["id"],)
+                    )
+                    print(f"[closed_orders] Заказ #{order_id} подтверждён: сообщение удалено")
+
+                db.commit()
+
+                if rows:
+                    try:
+                        await update_table_messages()
+                    except Exception as error:
+                        print(f"[closed_orders] Ошибка обновления таблицы: {error}")
+
+        with use_guild(None):
+            db.execute(
+                "UPDATE closed_orders SET processed = 1 WHERE order_id = ?",
+                (order_id,)
+            )
+            db.commit()
 
 
 async def check_stale_updates():
@@ -1389,18 +1513,48 @@ async def order_add(
             "Ошибка: указанная строка не существует."
         )
 
-    if (
-        target["player"]
-        or target["before_coins"]
-        or target["paid_coins"]
-        or target["before_gems"]
-        or target["paid_gems"]
-    ):
+    if is_row_filled(target):
         return await send_result(
             interaction,
             "Эта строка уже занята. Используйте /order change для изменения данных."
         )
 
+    fill_order_row(target["id"], player, before, paid, currency, link, interaction.user)
+
+    await update_table_messages()
+    await send_result(interaction, "Заказ добавлен.")
+
+
+def is_row_filled(target) -> bool:
+    return bool(
+        target["player"]
+        or target["before_coins"]
+        or target["paid_coins"]
+        or target["before_gems"]
+        or target["paid_gems"]
+    )
+
+
+def first_free_row():
+    """Первая пустая строка таблицы (по порядку блоков и строк)."""
+    return db.execute(
+        """
+        SELECT rows.*
+        FROM rows
+        JOIN blocks ON blocks.block_number = rows.block_number
+        WHERE rows.player = ''
+          AND COALESCE(rows.before_coins, 0) = 0
+          AND COALESCE(rows.paid_coins, 0) = 0
+          AND COALESCE(rows.before_gems, 0) = 0
+          AND COALESCE(rows.paid_gems, 0) = 0
+        ORDER BY blocks.position, rows.row_number
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: str, user):
+    """Записывает новый заказ в пустую строку."""
     now_iso = datetime.now(timezone.utc).isoformat()
     db.execute(
         """
@@ -1423,6 +1577,8 @@ async def order_add(
             created_by_id = ?,
             ping_sent = 0,
             last_stale_message_id = 0,
+            chat_id = '',
+            farm_finished = 0,
             mark = ''
         WHERE id = ?
         """,
@@ -1436,16 +1592,13 @@ async def order_add(
             now_iso,
             0,
             link,
-            str(interaction.user),
+            str(user),
             now_iso,
-            str(interaction.user.id),
-            target["id"]
+            str(user.id),
+            row_id
         )
     )
     db.commit()
-
-    await update_table_messages()
-    await send_result(interaction, "Заказ добавлен.")
 
 
 @order_group.command(name="change", description="Изменить заказ")
@@ -2218,6 +2371,18 @@ async def menu_set_channel(interaction: discord.Interaction):
     await send_result(interaction, "Теперь таблица этого сервера в этом канале.")
 
 
+@menu_group.command(name="set-sales-channel", description="Сюда будут приходить карточки новых продаж FunPay")
+async def menu_set_sales_channel(interaction: discord.Interaction):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    # Очередь продаж одна (в базе основного сервера), поэтому и канал там
+    with use_guild(None):
+        set_setting("sales_channel_id", str(interaction.channel_id))
+
+    await send_result(interaction, "Карточки новых продаж FunPay будут приходить в этот канал.")
+
+
 @menu_group.command(name="set-stale-channel", description="Сделать этот канал каналом уведомлений о просрочке")
 async def menu_set_stale_channel(interaction: discord.Interaction):
     if not is_manager(interaction):
@@ -2265,6 +2430,380 @@ async def on_command_error(interaction: discord.Interaction, error: Exception):
 
 bot.tree.interaction_check = set_interaction_guild
 bot.tree.on_error = on_command_error
+
+
+# -----------------------------
+# Продажи FunPay: карточка с кнопкой «В таблицу»
+# -----------------------------
+#
+# FunPay-бот (FunPay_sales.py) кладёт оплаченные продажи в pending_sales
+# базы основного сервера. Здесь они публикуются карточками в канал продаж
+# (по умолчанию — канал таблицы основного сервера). Кнопка открывает
+# форму с уже заполненными ссылкой, количеством и валютой, и заказ
+# записывается в таблицу того сервера, где нажали кнопку.
+
+SALES_CHECK_SECONDS = 10
+
+
+def sale_link(order_id: str) -> str:
+    return f"https://funpay.com/orders/{order_id}/"
+
+
+def get_pending_sale(order_id: str):
+    with use_guild(None):
+        return db.execute(
+            "SELECT * FROM pending_sales WHERE order_id = ?",
+            (order_id,)
+        ).fetchone()
+
+
+def update_pending_sale(order_id: str, **fields):
+    columns = ", ".join(f"{name} = ?" for name in fields)
+
+    with use_guild(None):
+        db.execute(
+            f"UPDATE pending_sales SET {columns} WHERE order_id = ?",
+            (*fields.values(), order_id)
+        )
+        db.commit()
+
+
+def format_amount(value) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def parse_amount(text: str):
+    """'50', '50к', '27.965', '27,965' -> число (монеты — в тысячах)."""
+    clean = (
+        text.strip()
+        .lower()
+        .replace(" ", "")
+        .replace("\u00a0", "")
+        .replace(",", ".")
+        .rstrip("кk")
+    )
+    value = float(clean)
+
+    if value < 0:
+        raise ValueError
+
+    return int(value) if value.is_integer() else value
+
+
+def parse_currency(text: str) -> Optional[str]:
+    value = text.strip().lower()
+
+    if value in ("coins", "coin", "монеты", "монета", "м", "c"):
+        return "coins"
+
+    if value in ("gems", "gem", "гемы", "гем", "г", "g"):
+        return "gems"
+
+    return None
+
+
+def sale_paid_text(sale) -> Optional[str]:
+    amount = sale["amount"] or 0
+
+    if not amount:
+        return None
+
+    if sale["currency"] == "gems":
+        return str(amount)
+
+    # Монеты в таблице хранятся в тысячах: 50 000 шт. -> 50
+    return format_amount(amount / 1000)
+
+
+def build_sale_embed(sale) -> discord.Embed:
+    gems = sale["currency"] == "gems"
+    status = sale["status"]
+
+    embed = discord.Embed(
+        title=f"🛒 Продажа #{sale['order_id']}",
+        url=sale_link(sale["order_id"]),
+        color=0x2ECC71 if status == "new" else 0x95A5A6
+    )
+
+    amount = f"{sale['amount']:,}".replace(",", " ") if sale["amount"] else "?"
+
+    embed.add_field(name="Покупатель", value=sale["buyer"] or "—")
+    embed.add_field(
+        name="Количество",
+        value=f"{amount} шт. ({'💎 гемы' if gems else '💰 монеты'})"
+    )
+    embed.add_field(name="Сумма", value=sale["price"] or "—")
+    embed.add_field(
+        name="Ник в игре",
+        value=sale["player"] or "пока неизвестен — покупатель может написать /info ник в чат FunPay",
+        inline=False
+    )
+
+    if status == "added":
+        embed.set_footer(text=f"✅ Записано в строку {sale['row_name']} — {sale['done_by']}")
+    elif status == "skipped":
+        embed.set_footer(text=f"Пропущено — {sale['done_by']}")
+
+    return embed
+
+
+def sale_view(order_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(SaleButton("add", order_id))
+    view.add_item(SaleButton("skip", order_id))
+    return view
+
+
+async def edit_sale_card(sale, with_buttons: bool):
+    if not sale["card_message_id"]:
+        return
+
+    try:
+        channel = bot.get_channel(sale["card_channel_id"])
+        if channel is None:
+            channel = await bot.fetch_channel(sale["card_channel_id"])
+
+        await channel.get_partial_message(sale["card_message_id"]).edit(
+            embed=build_sale_embed(sale),
+            view=sale_view(sale["order_id"]) if with_buttons else None
+        )
+    except discord.HTTPException as error:
+        print(f"[sales] Не удалось обновить карточку #{sale['order_id']}: {error}")
+
+
+class SaleButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"sale:(?P<action>add|skip):(?P<order_id>[A-Za-z0-9]+)"
+):
+    """Кнопки карточки. Работают и после перезапуска бота."""
+
+    def __init__(self, action: str, order_id: str):
+        if action == "add":
+            button = discord.ui.Button(
+                label="В таблицу",
+                emoji="➕",
+                style=discord.ButtonStyle.success,
+                custom_id=f"sale:add:{order_id}"
+            )
+        else:
+            button = discord.ui.Button(
+                label="Пропустить",
+                emoji="✖️",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sale:skip:{order_id}"
+            )
+
+        super().__init__(button)
+        self.action = action
+        self.order_id = order_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["action"], match["order_id"])
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            return
+
+        current_guild_id.set(interaction.guild_id)
+
+        if not can_use_order(interaction):
+            return await deny(interaction)
+
+        sale = get_pending_sale(self.order_id)
+
+        if sale is None or sale["status"] != "new":
+            return await interaction.response.send_message(
+                "Эта продажа уже обработана.",
+                ephemeral=True
+            )
+
+        if self.action == "skip":
+            update_pending_sale(
+                self.order_id,
+                status="skipped",
+                done_by=str(interaction.user)
+            )
+            await interaction.response.edit_message(
+                embed=build_sale_embed(get_pending_sale(self.order_id)),
+                view=None
+            )
+            return
+
+        await interaction.response.send_modal(SaleModal(sale))
+
+
+class SaleModal(discord.ui.Modal):
+    def __init__(self, sale):
+        super().__init__(title=f"Заказ #{sale['order_id']} в таблицу", timeout=600)
+
+        self.order_id = sale["order_id"]
+        unit = "" if sale["currency"] == "gems" else " (в тысячах)"
+
+        self.player = discord.ui.TextInput(
+            label="Ник в игре",
+            default=sale["player"] or None,
+            max_length=100
+        )
+        self.paid = discord.ui.TextInput(
+            label=f"Оплачено{unit}",
+            default=sale_paid_text(sale),
+            max_length=20
+        )
+        self.before = discord.ui.TextInput(
+            label=f"До заказа{unit}",
+            placeholder="Баланс аккаунта до заказа",
+            max_length=20
+        )
+        self.currency = discord.ui.TextInput(
+            label="Валюта: coins или gems",
+            default=sale["currency"],
+            max_length=10
+        )
+        self.row = discord.ui.TextInput(
+            label="Строка (пусто — первая свободная)",
+            placeholder="например 1.2",
+            required=False,
+            max_length=10
+        )
+
+        for item in (self.player, self.paid, self.before, self.currency, self.row):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        current_guild_id.set(interaction.guild_id)
+
+        async def fail(text: str):
+            await interaction.response.send_message(text, ephemeral=True)
+
+        sale = get_pending_sale(self.order_id)
+
+        if sale is None or sale["status"] != "new":
+            return await fail("Эта продажа уже обработана.")
+
+        player = self.player.value.strip()
+        if not player:
+            return await fail("Укажите ник в игре.")
+
+        currency = parse_currency(self.currency.value)
+        if currency is None:
+            return await fail("Валюта должна быть coins или gems.")
+
+        try:
+            paid = parse_amount(self.paid.value)
+            before = parse_amount(self.before.value)
+        except ValueError:
+            return await fail("«Оплачено» и «До заказа» должны быть числами.")
+
+        row_name = self.row.value.strip()
+
+        if row_name:
+            target = get_row(row_name)
+            if not target:
+                return await fail(f"Строки {row_name} нет в таблице.")
+        else:
+            target = first_free_row()
+            if not target:
+                return await fail("Свободных строк нет. Добавьте строку: /menu add-row.")
+
+        row_name = f"{target['block_number']}.{target['row_number']}"
+
+        if is_row_filled(target):
+            return await fail(f"Строка {row_name} уже занята.")
+
+        await interaction.response.defer(ephemeral=True)
+
+        fill_order_row(
+            target["id"],
+            player,
+            before,
+            paid,
+            currency,
+            sale_link(self.order_id),
+            interaction.user
+        )
+
+        update_pending_sale(
+            self.order_id,
+            status="added",
+            player=player,
+            done_by=str(interaction.user),
+            row_name=row_name
+        )
+        await edit_sale_card(get_pending_sale(self.order_id), with_buttons=False)
+
+        await update_table_messages()
+        await send_result(interaction, f"Заказ #{self.order_id} записан в строку {row_name}.")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"[sales] Ошибка формы #{self.order_id}: {error!r}")
+        try:
+            await send_result(interaction, f"Ошибка: {error}")
+        except Exception:
+            pass
+
+
+bot.add_dynamic_items(SaleButton)
+
+
+async def publish_sale_cards():
+    with use_guild(None):
+        sales = db.execute(
+            """
+            SELECT *
+            FROM pending_sales
+            WHERE status = 'new'
+              AND (card_message_id = 0 OR card_player != player)
+            ORDER BY created_at
+            """
+        ).fetchall()
+
+        if not sales:
+            return
+
+        channel_id = guild_setting_int("sales_channel_id", 0) or table_channel_id()
+
+    if not channel_id:
+        print("[sales] Канал для карточек продаж не задан (/menu set-sales-channel)")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+
+    for sale in sales:
+        if sale["card_message_id"]:
+            # Покупатель прислал ник — обновляем карточку
+            await edit_sale_card(sale, with_buttons=True)
+        else:
+            message = await channel.send(
+                embed=build_sale_embed(sale),
+                view=sale_view(sale["order_id"])
+            )
+            update_pending_sale(
+                sale["order_id"],
+                card_channel_id=channel.id,
+                card_message_id=message.id
+            )
+
+        update_pending_sale(sale["order_id"], card_player=sale["player"])
+
+
+async def sales_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            await publish_sale_cards()
+        except Exception as error:
+            print(f"[sales] Ошибка публикации продаж: {error!r}")
+
+        try:
+            await process_closed_orders()
+        except Exception as error:
+            print(f"[closed_orders] Ошибка: {error!r}")
+
+        await asyncio.sleep(SALES_CHECK_SECONDS)
 
 
 # -----------------------------
@@ -2324,14 +2863,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     target = get_row(match.group(1)) if match else None
 
     if is_finish:
-        if target:
-            # Заодно удаляем уведомление о просрочке этой строки
+        # Теперь строка освобождается сразу, когда аккаунт нафармил, и в ней
+        # уже может быть новый заказ — её не трогаем. Очищаем только строку
+        # из старого уведомления (до обновления), которое к ней привязано.
+        if target and target["finish_message_id"] == message.id:
             await delete_row_notifications(target["id"])
             clear_row_by_id(target["id"])
             print(f"Строка {match.group(1)} очищена по реакции от {payload.user_id}")
             await update_table_messages()
-        else:
-            print("Строка из уведомления не найдена, возможно уже удалена.")
+
+        db.execute(
+            "DELETE FROM finished_orders WHERE message_id = ?",
+            (message.id,)
+        )
+        db.commit()
 
     if is_stale and target and target["last_stale_message_id"] == message.id:
         db.execute(
@@ -2475,7 +3020,10 @@ async def on_ready():
             print(f"Ошибка обновления таблицы (сервер {guild_id}): {error}")
 
     # Запускаем фоновую проверку устаревших монет
-    bot.loop.create_task(stale_check_loop())
+    if not getattr(bot, "background_started", False):
+        bot.background_started = True
+        bot.loop.create_task(stale_check_loop())
+        bot.loop.create_task(sales_loop())
 
 
 if not TOKEN:

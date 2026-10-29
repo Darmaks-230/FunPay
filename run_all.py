@@ -21,6 +21,7 @@ from funpay_shared import BASE_DIR, bot, chat_storage, dispatcher
 
 import FunPay_commands
 import FunPay_messages
+import FunPay_sales
 import auto_raise
 
 
@@ -119,6 +120,7 @@ async def main() -> None:
     dispatcher.connect_routers(
         FunPay_commands.router,
         FunPay_messages.router,
+        FunPay_sales.router,
     )
 
     await asyncio.gather(
