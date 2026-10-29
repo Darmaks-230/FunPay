@@ -10,7 +10,7 @@ import discord
 from funpaybotengine import Router
 from funpaybotengine.types import Message
 
-from funpay_shared import BASE_DIR, bot as funpay_bot, dispatcher
+from funpay_shared import BASE_DIR, bot as funpay_bot, chat_storage, dispatcher
 
 
 # =========================
@@ -260,7 +260,7 @@ def clean_channel_name(username: str) -> str:
     if not username:
         username = "unknown"
 
-    return f"funpay-{username[:85]}"
+    return username[:100]
 
 
 def get_username(message: Message) -> str:
@@ -274,6 +274,68 @@ def get_username(message: Message) -> str:
         return str(username)
 
     return "Пользователь FunPay"
+
+
+def get_owner_username():
+    try:
+        return funpay_bot.username
+    except Exception:
+        return None
+
+
+async def get_buyer_username(
+    message: Message,
+    chat_id: str,
+    sender_id
+):
+    """
+    Ник покупателя (собеседника) для названия канала.
+
+    Отправитель сообщения для этого не подходит: это может быть
+    сам продавец, системное сообщение FunPay или сообщение без
+    заголовка (тогда ника нет вовсе). Поэтому сначала берём ник
+    из превью чата FunPay — там всегда собеседник.
+    """
+
+    try:
+        preview = await chat_storage.get_chat_preview(
+            int(chat_id)
+        )
+    except (TypeError, ValueError):
+        preview = None
+
+    if preview is not None and preview.username:
+        return preview.username
+
+    not_buyer = {
+        "funpay",
+        "вы",
+        "пользователь funpay",
+        (get_owner_username() or "").lower()
+    }
+
+    sender_username = getattr(
+        message,
+        "sender_username",
+        None
+    )
+
+    if (
+        sender_username
+        and not is_owner_id(sender_id)
+        and sender_username.lower() not in not_buyer
+    ):
+        return sender_username
+
+    saved_username = user_channels.get(
+        str(chat_id),
+        {}
+    ).get("username")
+
+    if saved_username and saved_username.lower() not in not_buyer:
+        return saved_username
+
+    return None
 
 
 def get_sender_id(message: Message):
@@ -632,9 +694,45 @@ async def move_channel_to_top(channel):
 # Каналы и webhook
 # =========================
 
+async def rename_channel_if_needed(
+    channel,
+    buyer_username
+):
+    if not buyer_username:
+        return
+
+    channel_name = clean_channel_name(
+        buyer_username
+    )
+
+    if channel.name == channel_name:
+        return
+
+    try:
+        old_name = channel.name
+
+        await channel.edit(
+            name=channel_name,
+            reason="Название по нику покупателя"
+        )
+
+        logging.info(
+            "Канал #%s переименован в #%s",
+            old_name,
+            channel_name
+        )
+
+    except discord.HTTPException as error:
+        logging.error(
+            "Ошибка переименования канала #%s: %s",
+            channel.name,
+            error
+        )
+
+
 async def get_or_create_user_channel(
     chat_id: str,
-    username: str
+    buyer_username
 ):
     await discord_ready.wait()
 
@@ -665,13 +763,20 @@ async def get_or_create_user_channel(
                         )
                     )
 
-                    saved_data["username"] = username
+                    if buyer_username:
+                        saved_data["username"] = buyer_username
+
                     saved_data["last_activity"] = (
                         utc_now_iso()
                     )
 
                     user_channels[channel_key] = saved_data
                     save_channels(user_channels)
+
+                    await rename_channel_if_needed(
+                        channel,
+                        buyer_username
+                    )
 
                     await move_channel_to_top(
                         channel
@@ -685,9 +790,13 @@ async def get_or_create_user_channel(
                         error
                     )
 
-        channel_name = clean_channel_name(
-            username
-        )
+        if buyer_username:
+            channel_name = clean_channel_name(
+                buyer_username
+            )
+        else:
+            # Ник пока неизвестен — переименуем, когда узнаем
+            channel_name = f"chat-{chat_id}"
 
         channel = discord.utils.get(
             discord_category.text_channels,
@@ -716,7 +825,7 @@ async def get_or_create_user_channel(
 
         user_channels[channel_key] = {
             "chat_id": chat_id,
-            "username": username,
+            "username": buyer_username,
             "channel_id": channel.id,
             "webhook_url": webhook.url,
             "last_activity": utc_now_iso()
@@ -733,13 +842,14 @@ async def get_or_create_user_channel(
 
 async def send_to_user_channel(
     username: str,
+    buyer_username,
     text: str,
     chat_id: str,
     event_type: str
 ):
     channel, webhook = await get_or_create_user_channel(
         chat_id=chat_id,
-        username=username
+        buyer_username=buyer_username
     )
 
     embed = build_embed(
@@ -1022,8 +1132,15 @@ async def handle_funpay_message(message: Message):
     )
 
     try:
+        buyer_username = await get_buyer_username(
+            message,
+            chat_id,
+            sender_id
+        )
+
         await send_to_user_channel(
             username=username,
+            buyer_username=buyer_username,
             text=text,
             chat_id=chat_id,
             event_type=event_type
@@ -1072,7 +1189,10 @@ async def main():
 
     await asyncio.gather(
         run_discord(),
-        funpay_bot.listen_events(dispatcher)
+        funpay_bot.listen_events(
+            dispatcher,
+            session_storage=chat_storage
+        )
     )
 
 

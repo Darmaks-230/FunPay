@@ -17,7 +17,7 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 
-from funpay_shared import BASE_DIR, bot, dispatcher
+from funpay_shared import BASE_DIR, bot, chat_storage, dispatcher
 
 import FunPay_commands
 import FunPay_messages
@@ -123,7 +123,10 @@ async def main() -> None:
 
     await asyncio.gather(
         supervise("Discord-таблица (main.py)", run_main_table_bot),
-        supervise("Опрос FunPay", lambda: bot.listen_events(dispatcher)),
+        supervise(
+            "Опрос FunPay",
+            lambda: bot.listen_events(dispatcher, session_storage=chat_storage),
+        ),
         supervise("Discord для сообщений FunPay", run_funpay_messages_discord),
         supervise("Очистка старых каналов", FunPay_messages.cleanup_inactive_channels),
         supervise("Проверка фарма", FunPay_commands.farm_checker),

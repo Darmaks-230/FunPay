@@ -13,6 +13,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from funpaybotengine import Bot, Dispatcher
+from funpaybotengine.storage.inmemory import InMemoryStorage
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,3 +28,7 @@ if not GOLDEN_KEY:
 
 bot = Bot(golden_key=GOLDEN_KEY)
 dispatcher = Dispatcher()
+
+# Превью чатов из опроса FunPay: по chat_id даёт ник собеседника.
+# Передаётся в listen_events(..., session_storage=chat_storage).
+chat_storage = InMemoryStorage()
