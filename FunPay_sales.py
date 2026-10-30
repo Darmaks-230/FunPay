@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from funpaybotengine import Router
-from funpaybotengine.dispatching.events import NewSaleEvent, SaleClosedEvent
+from funpaybotengine.dispatching.events import NewSaleEvent
+from funpaybotengine.types import Message
 
 
 # Без импорта funpay_shared: main.py берёт отсюда схему таблицы,
@@ -45,15 +46,34 @@ CREATE TABLE IF NOT EXISTS pending_sales (
 """
 
 
-# Заказы, которые покупатель подтвердил на FunPay. main.py по ним
-# убирает аккаунт из таблицы и удаляет сообщение «завершил фарм».
+# Закрытые заказы: подтверждены (покупателем или администратором)
+# или по ним сделан возврат. main.py по ним убирает аккаунт из таблицы
+# и удаляет сообщение «завершил фарм».
 CREATE_CLOSED_ORDERS = """
 CREATE TABLE IF NOT EXISTS closed_orders (
     order_id TEXT PRIMARY KEY,
     processed INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT ''
+    created_at TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT 'confirmed'
 )
 """
+
+# Причины закрытия заказа
+CLOSE_REASONS = {
+    "confirmed": "Заказ подтверждён покупателем",
+    "closed_by_admin": "Заказ подтверждён администратором",
+    "refunded": "Возврат по заказу",
+}
+
+
+def ensure_closed_orders_columns(connection) -> None:
+    """В базе от прошлой версии у closed_orders нет столбца reason."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(closed_orders)")}
+
+    if "reason" not in columns:
+        connection.execute(
+            "ALTER TABLE closed_orders ADD COLUMN reason TEXT NOT NULL DEFAULT 'confirmed'"
+        )
 
 # Аккаунты, которые нафармили (их строка уже освобождена).
 # Есть в базе каждого сервера: по ним удаляется сообщение «завершил фарм»
@@ -86,6 +106,7 @@ def connect() -> sqlite3.Connection:
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.execute(CREATE_PENDING_SALES)
     connection.execute(CREATE_CLOSED_ORDERS)
+    ensure_closed_orders_columns(connection)
     return connection
 
 
@@ -185,26 +206,59 @@ async def handle_new_sale(event: NewSaleEvent):
     )
 
 
-@router.on_sale_closed(as_task=True)
-async def handle_sale_closed(event: SaleClosedEvent):
-    """Покупатель подтвердил выполнение заказа."""
+def classify_order_message(text: str) -> tuple[str, str] | None:
+    """
+    Системное сообщение FunPay -> (номер заказа, причина закрытия).
 
-    order_id = event.object.meta.order_id
+    Свой разбор вместо событий библиотеки: она не узнаёт возврат,
+    сделанный администратором («Администратор … вернул деньги …»).
+    Частичный возврат заказ не закрывает — его не трогаем.
+    """
 
-    if not order_id:
+    lower = (text or "").strip().lower()
+    match = re.search(r"#([A-Za-z0-9]+)", text or "")
+
+    if not match:
+        return None
+
+    if (
+        "подтвердил успешное выполнение заказа" in lower
+        or "has confirmed that order" in lower
+    ):
+        by_admin = lower.startswith(("администратор", "the administrator"))
+        return match.group(1), "closed_by_admin" if by_admin else "confirmed"
+
+    if "вернул деньги покупателю" in lower or "has refunded the buyer" in lower:
+        return match.group(1), "refunded"
+
+    return None
+
+
+@router.on_new_message(as_task=True)
+async def handle_order_closed(message: Message):
+    # Только системные сообщения FunPay (у них отправитель с ID 0),
+    # чтобы покупатель не мог закрыть заказ, напечатав такой текст в чат.
+    if message.sender_id != 0:
         return
+
+    result = classify_order_message(message.text)
+
+    if result is None:
+        return
+
+    order_id, reason = result
 
     try:
         with connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO closed_orders(order_id, created_at)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO closed_orders(order_id, created_at, reason)
+                VALUES (?, ?, ?)
                 """,
-                (order_id, datetime.now(timezone.utc).isoformat()),
+                (order_id, datetime.now(timezone.utc).isoformat(), reason),
             )
     except sqlite3.Error:
-        logging.exception("Не удалось сохранить подтверждение заказа #%s", order_id)
+        logging.exception("Не удалось сохранить закрытие заказа #%s", order_id)
         return
 
-    logging.info("Покупатель подтвердил заказ #%s", order_id)
+    logging.info("%s: #%s", CLOSE_REASONS[reason], order_id)

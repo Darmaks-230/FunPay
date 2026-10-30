@@ -14,9 +14,11 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from FunPay_sales import (
+    CLOSE_REASONS,
     CREATE_CLOSED_ORDERS,
     CREATE_FINISHED_ORDERS,
     CREATE_PENDING_SALES,
+    ensure_closed_orders_columns,
     order_id_from_link,
 )
 
@@ -201,6 +203,7 @@ def init_db():
     )
     db.execute(CREATE_PENDING_SALES)
     db.execute(CREATE_CLOSED_ORDERS)
+    ensure_closed_orders_columns(db)
     db.execute(CREATE_FINISHED_ORDERS)
     db.commit()
 
@@ -972,17 +975,26 @@ async def finish_farm(row, total_balance, total, currency_name: str):
 
 async def process_closed_orders():
     """
-    Покупатель подтвердил заказ на FunPay (FunPay_sales.py кладёт его
-    в closed_orders): убираем аккаунт из таблицы, если он ещё там,
-    и удаляем сообщение «завершил фарм».
+    Заказ закрыт на FunPay — подтверждён покупателем или администратором
+    либо по нему сделан возврат (FunPay_sales.py кладёт его в closed_orders):
+    убираем аккаунт из таблицы, если он ещё там, удаляем сообщение
+    «завершил фарм», а необработанную карточку продажи переносим в историю.
     """
     with use_guild(None):
         closed = db.execute(
-            "SELECT order_id FROM closed_orders WHERE processed = 0"
+            "SELECT order_id, reason FROM closed_orders WHERE processed = 0"
         ).fetchall()
 
     for item in closed:
         order_id = item["order_id"]
+        reason = item["reason"] or "confirmed"
+        reason_text = CLOSE_REASONS.get(reason, CLOSE_REASONS["confirmed"])
+
+        # Продажа ещё не записана в таблицу — закрываем её карточку
+        sale = get_pending_sale(order_id)
+        if sale is not None and sale["status"] == "new":
+            update_pending_sale(order_id, status=reason, done_by="FunPay")
+            await archive_sale_card(get_pending_sale(order_id))
 
         for guild_id in known_guild_ids():
             with use_guild(guild_id):
@@ -997,9 +1009,9 @@ async def process_closed_orders():
 
                 for row in rows:
                     await delete_row_notifications(row["id"])
-                    clear_row_by_id(row["id"], "Заказ подтверждён покупателем")
+                    clear_row_by_id(row["id"], reason_text)
                     print(
-                        f"[closed_orders] Заказ #{order_id} подтверждён: "
+                        f"[closed_orders] {reason_text} #{order_id}: "
                         f"строка {row['block_number']}.{row['row_number']} очищена"
                     )
 
@@ -1014,7 +1026,7 @@ async def process_closed_orders():
                         "DELETE FROM finished_orders WHERE id = ?",
                         (notice["id"],)
                     )
-                    print(f"[closed_orders] Заказ #{order_id} подтверждён: сообщение удалено")
+                    print(f"[closed_orders] {reason_text} #{order_id}: сообщение удалено")
 
                 db.commit()
 
@@ -2371,6 +2383,18 @@ async def menu_set_channel(interaction: discord.Interaction):
     await send_result(interaction, "Теперь таблица этого сервера в этом канале.")
 
 
+@menu_group.command(name="set-history-channel", description="Сюда будут попадать обработанные продажи FunPay")
+async def menu_set_history_channel(interaction: discord.Interaction):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    # Очередь продаж одна (в базе основного сервера), поэтому и канал там
+    with use_guild(None):
+        set_setting("sales_history_channel_id", str(interaction.channel_id))
+
+    await send_result(interaction, "Обработанные продажи будут записываться в этот канал.")
+
+
 @menu_group.command(name="set-sales-channel", description="Сюда будут приходить карточки новых продаж FunPay")
 async def menu_set_sales_channel(interaction: discord.Interaction):
     if not is_manager(interaction):
@@ -2543,6 +2567,10 @@ def build_sale_embed(sale) -> discord.Embed:
         embed.set_footer(text=f"✅ Записано в строку {sale['row_name']} — {sale['done_by']}")
     elif status == "skipped":
         embed.set_footer(text=f"Пропущено — {sale['done_by']}")
+    elif status == "refunded":
+        embed.set_footer(text="↩️ Возврат до записи в таблицу")
+    elif status in ("confirmed", "closed_by_admin"):
+        embed.set_footer(text=f"{CLOSE_REASONS[status]} до записи в таблицу")
 
     return embed
 
@@ -2569,6 +2597,30 @@ async def edit_sale_card(sale, with_buttons: bool):
         )
     except discord.HTTPException as error:
         print(f"[sales] Не удалось обновить карточку #{sale['order_id']}: {error}")
+
+
+async def archive_sale_card(sale):
+    """
+    Продажа обработана: итоговая карточка уходит в канал истории
+    (/menu set-history-channel), а карточка с кнопками удаляется
+    из канала продаж.
+    """
+    with use_guild(None):
+        history_channel_id = guild_setting_int("sales_history_channel_id", 0)
+
+    if history_channel_id:
+        try:
+            channel = bot.get_channel(history_channel_id)
+            if channel is None:
+                channel = await bot.fetch_channel(history_channel_id)
+
+            await channel.send(embed=build_sale_embed(sale))
+        except discord.HTTPException as error:
+            print(f"[sales] Не удалось записать #{sale['order_id']} в историю: {error}")
+    else:
+        print("[sales] Канал истории продаж не задан (/menu set-history-channel)")
+
+    await delete_bot_message(sale["card_channel_id"], sale["card_message_id"])
 
 
 class SaleButton(
@@ -2624,10 +2676,8 @@ class SaleButton(
                 status="skipped",
                 done_by=str(interaction.user)
             )
-            await interaction.response.edit_message(
-                embed=build_sale_embed(get_pending_sale(self.order_id)),
-                view=None
-            )
+            await interaction.response.defer()
+            await archive_sale_card(get_pending_sale(self.order_id))
             return
 
         await interaction.response.send_modal(SaleModal(sale))
@@ -2730,7 +2780,7 @@ class SaleModal(discord.ui.Modal):
             done_by=str(interaction.user),
             row_name=row_name
         )
-        await edit_sale_card(get_pending_sale(self.order_id), with_buttons=False)
+        await archive_sale_card(get_pending_sale(self.order_id))
 
         await update_table_messages()
         await send_result(interaction, f"Заказ #{self.order_id} записан в строку {row_name}.")
