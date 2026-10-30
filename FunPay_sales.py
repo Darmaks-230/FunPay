@@ -10,7 +10,7 @@ pending_sales базы orders.sqlite3. Бот таблицы (main.py) берё�
 import logging
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from funpaybotengine import Router
@@ -115,6 +115,60 @@ def order_id_from_link(link: str) -> str:
     """'https://funpay.com/orders/RFZLSDVU/' -> 'RFZLSDVU'"""
     match = re.search(r"/orders/([A-Za-z0-9]+)", link or "")
     return match.group(1) if match else ""
+
+
+def find_order_for_chat(connection, chat_id, player: str, currency: str = "") -> str:
+    """
+    Номер заказа по чату покупателя (для строк со ссылкой на чат).
+
+    У покупателя может быть несколько заказов на один аккаунт (например,
+    монеты и гемы), поэтому подбираем по нику и валюте строки:
+    1. ник и валюта совпали;
+    2. единственный заказ в этой валюте;
+    3. ник совпал;
+    4. единственная свежая продажа в чате.
+    Если однозначно не выходит — не угадываем.
+    """
+
+    if not chat_id:
+        return ""
+
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    sales = connection.execute(
+        """
+        SELECT order_id, player, currency
+        FROM pending_sales
+        WHERE chat_id = ?
+          AND status IN ('new', 'added', 'queued')
+          AND created_at >= ?
+        ORDER BY created_at DESC
+        """,
+        (str(chat_id), since),
+    ).fetchall()
+
+    def same_player(sale) -> bool:
+        return bool(player) and (sale[1] or "").lower() == player.lower()
+
+    def same_currency(sale) -> bool:
+        return bool(currency) and sale[2] == currency
+
+    for sale in sales:
+        if same_player(sale) and same_currency(sale):
+            return sale[0]
+
+    by_currency = [sale for sale in sales if same_currency(sale)]
+    if len(by_currency) == 1:
+        return by_currency[0][0]
+
+    for sale in sales:
+        if same_player(sale):
+            return sale[0]
+
+    return sales[0][0] if len(sales) == 1 else ""
+
+
+def order_link(order_id: str) -> str:
+    return f"https://funpay.com/orders/{order_id}/"
 
 
 def connect() -> sqlite3.Connection:

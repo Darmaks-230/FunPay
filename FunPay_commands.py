@@ -8,7 +8,13 @@ from funpaybotengine import Router
 from funpaybotengine.types import Message
 
 from funpay_shared import bot, dispatcher
-from FunPay_sales import CREATE_FINISHED_ORDERS, set_pending_player
+from FunPay_sales import (
+    CREATE_FINISHED_ORDERS,
+    connect as connect_sales,
+    find_order_for_chat,
+    order_link,
+    set_pending_player,
+)
 
 
 # =================================================
@@ -166,28 +172,52 @@ def is_admin(message: Message) -> bool:
 
 def save_chat_id(player_name: str, chat_id: str) -> bool:
     """
-    Привязывает ID чата к игровому нику.
+    Привязывает ID чата к игровому нику. Пустую ссылку или ссылку
+    на чат в строке заменяет ссылкой на заказ (если он известен
+    по продажам — с учётом валюты строки) или на чат с покупателем.
     """
 
     try:
         updated = 0
+        chat_link = f"https://funpay.com/chat/?node={chat_id}"
 
-        for database_path in database_paths():
-            with sqlite3.connect(database_path) as connection:
-                cursor = connection.cursor()
+        with connect_sales() as sales_connection:
+            for database_path in database_paths():
+                with sqlite3.connect(database_path) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT id, currency, link
+                        FROM rows
+                        WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
+                        """,
+                        (player_name,)
+                    ).fetchall()
 
-                cursor.execute(
-                    """
-                    UPDATE rows
-                    SET chat_id = ?,
-                        farm_finished = 0
-                    WHERE LOWER(TRIM(player)) = LOWER(TRIM(?))
-                    """,
-                    (str(chat_id), player_name)
-                )
+                    for row_id, currency, link in rows:
+                        link = link or ""
 
-                connection.commit()
-                updated += cursor.rowcount
+                        if not link.strip() or "funpay.com/chat/" in link:
+                            order_id = find_order_for_chat(
+                                sales_connection,
+                                chat_id,
+                                player_name,
+                                currency or "coins"
+                            )
+                            link = order_link(order_id) if order_id else chat_link
+
+                        connection.execute(
+                            """
+                            UPDATE rows
+                            SET chat_id = ?,
+                                farm_finished = 0,
+                                link = ?
+                            WHERE id = ?
+                            """,
+                            (str(chat_id), link, row_id)
+                        )
+                        updated += 1
+
+                    connection.commit()
 
         return updated > 0
 

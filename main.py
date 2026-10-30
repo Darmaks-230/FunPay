@@ -22,6 +22,7 @@ from FunPay_sales import (
     CREATE_PENDING_SALES,
     ensure_closed_orders_columns,
     ensure_pending_sales_columns,
+    find_order_for_chat,
     order_id_from_link,
 )
 
@@ -1021,6 +1022,12 @@ async def finish_farm(row, total_balance, total, currency_name: str):
     link = row["link"] or ""
     order_id = order_id_from_link(link)
 
+    # В строке ссылка на чат — ищем заказ этого покупателя по чату
+    if not order_id:
+        chat_id = row["chat_id"] or chat_id_from_link(link)
+        with use_guild(None):
+            order_id = find_order_for_chat(db, chat_id, row["player"], row_currency(row))
+
     lines = [
         f"{mentions} ✅ {player_name} (строка {row_str}) завершил фарм!".strip(),
         f"Нафармлено: {format_big(total_balance)} из {format_big(total)} {currency_name}.",
@@ -1030,7 +1037,7 @@ async def finish_farm(row, total_balance, total, currency_name: str):
     if order_id:
         lines.append(f"Заказ: [#{order_id}](<{sale_link(order_id)}>)")
     elif link:
-        lines.append(f"Заказ: <{link}>")
+        lines.append(f"Заказ: [чат с покупателем](<{link}>)")
 
     # Следующие заказы этого аккаунта, ждущие в очереди
     with use_guild(None):
@@ -1085,7 +1092,7 @@ async def finish_farm(row, total_balance, total, currency_name: str):
             row["currency"] or "coins",
             total_balance,
             total,
-            row["chat_id"] or "",
+            row["chat_id"] or chat_id_from_link(row["link"]),
             channel.id,
             msg.id,
             # Если FunPay-бот уже успел написать покупателю — второй раз не пишем
@@ -1698,6 +1705,26 @@ def first_free_row():
     ).fetchone()
 
 
+def chat_id_from_link(link: str) -> str:
+    """
+    Чат покупателя на FunPay по ссылке в строке — чтобы по окончании
+    фарма ему ушло сообщение, даже если он не писал /info ник:
+    - ссылка на чат: https://funpay.com/chat/?node=293899498
+    - ссылка на заказ: чат берётся из сохранённой продажи
+    """
+    match = re.search(r"node=(\d+)", link or "")
+    if match:
+        return match.group(1)
+
+    order_id = order_id_from_link(link)
+    if order_id:
+        sale = get_pending_sale(order_id)
+        if sale is not None and sale["chat_id"]:
+            return sale["chat_id"]
+
+    return ""
+
+
 def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: str, user, xp_per_game: int = 0):
     """Записывает новый заказ в пустую строку."""
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1727,7 +1754,7 @@ def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: 
             created_by_id = ?,
             ping_sent = 0,
             last_stale_message_id = 0,
-            chat_id = '',
+            chat_id = ?,
             farm_finished = 0,
             mark = ''
         WHERE id = ?
@@ -1750,6 +1777,7 @@ def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: 
             str(user),
             now_iso,
             str(user.id),
+            chat_id_from_link(link),
             row_id
         )
     )
@@ -1846,7 +1874,16 @@ async def order_change(
             )
         )
         db.commit()
-        
+
+        # Новая ссылка — новая привязка к чату покупателя
+        chat_id = chat_id_from_link(link)
+        if chat_id:
+            db.execute(
+                "UPDATE rows SET chat_id = ? WHERE id = ?",
+                (chat_id, target["id"])
+            )
+            db.commit()
+
         # Удаляем сообщение о просрочке, если оно было
         if stale_msg_id:
             await delete_previous_stale_message(target["id"])
@@ -3241,6 +3278,18 @@ async def sales_loop():
             await process_closed_orders()
         except Exception as error:
             print(f"[closed_orders] Ошибка: {error!r}")
+
+        # Базу меняет и FunPay-бот (другой процесс): например, /info ник
+        # ставит ссылку на чат. Перерисовываем таблицы — правятся только
+        # изменившиеся блоки, так что лишних запросов к Discord нет.
+        for guild_id in known_guild_ids():
+            try:
+                with use_guild(guild_id):
+                    await update_table_messages()
+            except RuntimeError:
+                pass  # канал таблицы не задан — сообщит сама команда
+            except Exception as error:
+                print(f"[table] Ошибка обновления таблицы (сервер {guild_id}): {error!r}")
 
         await asyncio.sleep(SALES_CHECK_SECONDS)
 
