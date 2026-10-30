@@ -626,56 +626,105 @@ def is_ignored_command_or_response(text: str) -> bool:
     return False
 
 
-def detect_event_type(text: str) -> str:
+def detect_event_type(text: str, is_system: bool) -> str:
+    """
+    Тип события по системному сообщению FunPay.
+
+    Раньше слова искались в любом сообщении и не совпадали с
+    настоящими текстами FunPay: подтверждения, отзывы и возвраты
+    не распознавались, а фраза покупателя «хочу возврат»
+    считалась возвратом. Теперь проверяются только системные
+    сообщения FunPay и их точные формулировки.
+    """
+
+    if not is_system:
+        return "message"
+
     text = text.lower().strip()
 
     if any(word in text for word in [
-        "отзыв удален",
-        "отзыв удалён",
-        "удаление отзыва",
-        "review deleted"
+        "удалил отзыв к заказу",
+        "has deleted their feedback"
     ]):
         return "review_deleted"
 
     if any(word in text for word in [
-        "возврат",
-        "средства возвращены",
-        "деньги возвращены",
-        "refund"
+        "написал отзыв к заказу",
+        "изменил отзыв к заказу",
+        "has given feedback",
+        "has edited their feedback"
+    ]):
+        return "review"
+
+    if any(word in text for word in [
+        "вернул деньги покупателю",
+        "возвращена покупателю",
+        "has refunded the buyer",
+        "has been refunded"
     ]):
         return "refund"
 
     if any(word in text for word in [
-        "оплата заказа",
-        "заказ оплачен",
-        "оплатил заказ",
-        "покупатель оплатил",
-        "payment",
-        "paid"
-    ]):
-        return "payment"
-
-    if any(word in text for word in [
-        "заказ подтвержден",
-        "заказ подтверждён",
-        "подтвердил заказ",
-        "сделка завершена",
-        "заказ выполнен",
-        "order confirmed"
+        "подтвердил успешное выполнение заказа",
+        "has confirmed that order"
     ]):
         return "confirmation"
 
     if any(word in text for word in [
-        "новый отзыв",
-        "оставил отзыв",
-        "вам оставили отзыв",
-        "пользователь оценил",
-        "review",
-        "feedback"
+        "оплатил заказ",
+        "has paid for order"
     ]):
-        return "review"
+        return "payment"
 
     return "message"
+
+
+async def fetch_review(text: str):
+    """
+    Системное сообщение «написал отзыв к заказу #…» не содержит
+    сам отзыв — берём оценку и текст со страницы заказа.
+    """
+
+    match = re.search(r"#([A-Za-z0-9]+)", text or "")
+
+    if not match:
+        return None
+
+    try:
+        page = await funpay_bot.get_order_page(match.group(1))
+    except Exception:
+        logging.exception(
+            "Не удалось получить отзыв к заказу #%s",
+            match.group(1)
+        )
+        return None
+
+    review = page.review
+
+    if review is None or (not review.rating and not review.text):
+        return None
+
+    return review
+
+
+def add_review_fields(embed, review):
+    if review is None:
+        return
+
+    if review.rating:
+        stars = "⭐" * review.rating + "☆" * (5 - review.rating)
+        embed.add_field(
+            name="Оценка",
+            value=f"{stars} ({review.rating}/5)",
+            inline=False
+        )
+
+    if review.text:
+        embed.add_field(
+            name="Отзыв",
+            value=review.text[:1024],
+            inline=False
+        )
 
 
 def build_embed(
@@ -935,7 +984,8 @@ async def send_to_user_channel(
     text: str,
     chat_id: str,
     event_type: str,
-    image_url=None
+    image_url=None,
+    review=None
 ):
     channel, webhook = await get_or_create_user_channel(
         chat_id=chat_id,
@@ -948,6 +998,8 @@ async def send_to_user_channel(
         chat_id=chat_id,
         event_type=event_type
     )
+
+    add_review_fields(embed, review)
 
     image_file = None
 
@@ -989,9 +1041,12 @@ async def send_to_events_channel(
     username: str,
     text: str,
     chat_id: str,
-    event_type: str
+    event_type: str,
+    review=None
 ):
-    if event_type == "message":
+    # Оплату не дублируем: по каждой продаже уже есть карточка
+    # «В таблицу» и итог в истории продаж (main.py)
+    if event_type in ("message", "payment"):
         return
 
     embed = build_embed(
@@ -1000,6 +1055,8 @@ async def send_to_events_channel(
         chat_id=chat_id,
         event_type=event_type
     )
+
+    add_review_fields(embed, review)
 
     await discord_events_channel.send(
         embed=embed
@@ -1238,8 +1295,10 @@ async def handle_funpay_message(message: Message):
         sender_id
     )
 
+    # У системных сообщений FunPay отправитель с ID 0
     event_type = detect_event_type(
-        text
+        text,
+        is_system=str(sender_id) == "0"
     )
 
     print(
@@ -1258,20 +1317,27 @@ async def handle_funpay_message(message: Message):
             sender_id
         )
 
+        review = None
+
+        if event_type == "review":
+            review = await fetch_review(text)
+
         await send_to_user_channel(
             username=username,
             buyer_username=buyer_username,
             text=text,
             chat_id=chat_id,
             event_type=event_type,
-            image_url=image_url
+            image_url=image_url,
+            review=review
         )
 
         await send_to_events_channel(
             username=username,
             text=text,
             chat_id=chat_id,
-            event_type=event_type
+            event_type=event_type,
+            review=review
         )
 
     except Exception:
