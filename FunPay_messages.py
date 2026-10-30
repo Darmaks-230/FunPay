@@ -599,7 +599,7 @@ def is_ignored_command_or_response(text: str) -> bool:
     first_line = normalized_text.splitlines()[0].strip()
 
     if re.match(
-        r"^/(?:info|money)(?:\s|$)",
+        r"^/(?:info|money|exp)(?:\s|$)",
         first_line,
         flags=re.IGNORECASE
     ):
@@ -616,6 +616,8 @@ def is_ignored_command_or_response(text: str) -> bool:
         "баланс игрока:",
         "баланс до заказа:",
         "цель фарма:",
+        "расчет опыта:",
+        "использование: /exp",
         "прогресс:",
         "не найден в базе данных."
     ]

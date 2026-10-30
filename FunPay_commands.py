@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
+import time
 from pathlib import Path
 
 from funpaybotengine import Router
@@ -516,6 +518,156 @@ async def my_id_command(message: Message):
 # Команда /help
 # =================================================
 
+# =================================================
+# Команда /exp — расчёт опыта до 20 уровня башни
+# =================================================
+
+MAX_TOWER_LEVEL = 20
+
+# Опыт, нужный на каждый уровень: индекс — уровень (1..20)
+EVOLUTION_LEVEL_EXP = [
+    0, 75, 80, 86, 93, 100, 107, 115, 124, 133, 143,
+    154, 166, 178, 192, 206, 221, 238, 256, 275, 296,
+]
+REGULAR_LEVEL_EXP = [
+    0, 50, 54, 59, 64, 70, 76, 83, 91, 99, 108,
+    118, 129, 140, 153, 167, 182, 198, 216, 235, 257,
+]
+
+TOWER_TYPES = {
+    "evolution": EVOLUTION_LEVEL_EXP,
+    "regular": REGULAR_LEVEL_EXP,
+}
+
+# Названия башен (в нижнем регистре, без пробелов) -> (название, тип)
+TOWER_ALIASES = {
+    "juggernaut": ("JUGGERNAUT", "evolution"),
+    "jaggernaut": ("JUGGERNAUT", "evolution"),
+    "operator": ("OPERATOR", "evolution"),
+    "enforcer": ("ENFORCER", "evolution"),
+    "kingpin": ("KINGPIN", "evolution"),
+    "shotgunner": ("SHOTGUNNER", "regular"),
+    "crookboss": ("CROOK BOSS", "regular"),
+    "scout": ("SCOUT", "regular"),
+    "minigunner": ("MINIGUNNER", "regular"),
+}
+
+EXP_USAGE = (
+    "❗Использование: /exp <башня> <текущий уровень> <кол-во опыта текущего уровня>\n"
+    "✅Пример: /exp scout 5 30\n"
+    "⏫Эволюции: Juggernaut, Operator, Enforcer, Kingpin\n"
+    "⏹️Обычные: Shotgunner, Crook Boss, Scout, Minigunner"
+)
+
+# Лоты «ФАРМ УРОВНЯ НА <БАШНЯ>» берутся из профиля продавца:
+# если лот пересоздать, ссылка обновится сама. Кэш — на час.
+TOWER_LOTS_CACHE_SECONDS = 60 * 60
+_tower_lots: dict[str, str] = {}
+_tower_lots_loaded_at = 0.0
+
+
+async def get_tower_lot_link(tower_name: str) -> str:
+    global _tower_lots, _tower_lots_loaded_at
+
+    if not _tower_lots or time.monotonic() - _tower_lots_loaded_at > TOWER_LOTS_CACHE_SECONDS:
+        try:
+            profile = await bot.get_profile_page(bot.userid)
+            lots = {}
+
+            for groups in (profile.offers or {}).values():
+                for offers in groups.values():
+                    for offer in offers:
+                        title = (offer.title or "").upper()
+                        if "ФАРМ УРОВНЯ" not in title:
+                            continue
+                        for name, _ in TOWER_ALIASES.values():
+                            if f"НА {name}" in title:
+                                lots[name] = f"https://funpay.com/lots/offer?id={offer.id}"
+
+            _tower_lots = lots
+            _tower_lots_loaded_at = time.monotonic()
+        except Exception:
+            logging.exception("Не удалось получить лоты башен для /exp")
+
+    return _tower_lots.get(tower_name, "")
+
+
+def calculate_exp_to_max(level_exp: list[int], level: int, exp_on_level: int) -> int:
+    """Сколько опыта осталось до 20 уровня."""
+    return sum(level_exp[level + 1:MAX_TOWER_LEVEL + 1]) - exp_on_level
+
+
+@router.on_new_message(as_task=True)
+async def exp_command(message: Message):
+    text = (message.text or "").strip()
+
+    if not re.match(r"^/exp(?:\s|$)", text, flags=re.IGNORECASE):
+        return
+
+    parts = text.split()[1:]
+
+    if len(parts) < 3:
+        await message.reply(text=EXP_USAGE)
+        return
+
+    tower_key = "".join(parts[:-2]).lower()
+    tower = TOWER_ALIASES.get(tower_key)
+
+    if tower is None:
+        await message.reply(text=f"Башня «{' '.join(parts[:-2])}» не найдена.\n\n{EXP_USAGE}")
+        return
+
+    try:
+        level = int(parts[-2])
+        exp_on_level = int(parts[-1])
+    except ValueError:
+        await message.reply(text=f"Уровень и опыт должны быть числами.\n\n{EXP_USAGE}")
+        return
+
+    tower_name, tower_type = tower
+    level_exp = TOWER_TYPES[tower_type]
+    title = tower_name
+
+    if level >= MAX_TOWER_LEVEL:
+        await message.reply(text=f"💠 {title}: уже {MAX_TOWER_LEVEL} уровень, опыт не нужен.")
+        return
+
+    if level < 0:
+        await message.reply(text=f"Уровень должен быть от 0 до {MAX_TOWER_LEVEL}.")
+        return
+
+    next_level_exp = level_exp[level + 1]
+
+    if exp_on_level < 0 or exp_on_level >= next_level_exp:
+        await message.reply(
+            text=(
+                f"На {level} уровне может быть от 0 до {next_level_exp - 1} опыта "
+                f"(на {level + 1} уровень нужно {next_level_exp})."
+            )
+        )
+        return
+
+    need = calculate_exp_to_max(level_exp, level, exp_on_level)
+    need_text = f"{need:,}".replace(",", " ")
+    lot_link = await get_tower_lot_link(tower_name)
+    pay_line = (
+        f"💳 Оплатите {need} шт. в лоте: {lot_link}"
+        if lot_link
+        else f"💳 Оплатите {need} шт. в лоте «ФАРМ УРОВНЯ НА {tower_name}»"
+    )
+
+    await message.reply(
+        text=(
+            f"💠 Расчёт опыта: {title}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Сейчас: {level} уровень, {exp_on_level} опыта\n"
+            f"🎯 До {MAX_TOWER_LEVEL} уровня нужно: {need_text} опыта\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{pay_line}"
+        )
+    )
+
+
 @router.on_new_message(as_task=True)
 async def help_command(message: Message):
     text = (message.text or "").strip()
@@ -529,6 +681,7 @@ async def help_command(message: Message):
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "/money <ник> — баланс и привязка чата\n"
             "/info <ник> — подробная информация\n"
+            "/exp <башня> <уровень> <опыт> — сколько опыта оплатить до 20 уровня\n"
             "/help — справка\n"
         )
     )
