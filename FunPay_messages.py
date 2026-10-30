@@ -612,6 +612,7 @@ def is_ignored_command_or_response(text: str) -> bool:
         "информация об игроке:",
         "монеты игрока",
         "гемы игрока",
+        "опыт игрока",
         "баланс игрока:",
         "баланс до заказа:",
         "цель фарма:",
@@ -762,7 +763,22 @@ def build_embed(
         color=style["color"]
     )
 
-    if chat_id:
+    # Системное сообщение о заказе (оплата, подтверждение, отзыв,
+    # возврат) ведёт на страницу заказа, остальные — в чат
+    order_match = (
+        re.search(r"#([A-Za-z0-9]+)", text)
+        if event_type != "message"
+        else None
+    )
+
+    if order_match:
+        order_url = f"https://funpay.com/orders/{order_match.group(1)}/"
+        embed.url = order_url
+        embed.set_author(
+            name=username,
+            url=order_url
+        )
+    elif chat_id:
         chat_url = (
             f"https://funpay.com/chat/"
             f"?node={chat_id}"

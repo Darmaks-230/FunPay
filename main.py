@@ -13,12 +13,15 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import json
+
 from FunPay_sales import (
     CLOSE_REASONS,
     CREATE_CLOSED_ORDERS,
     CREATE_FINISHED_ORDERS,
     CREATE_PENDING_SALES,
     ensure_closed_orders_columns,
+    ensure_pending_sales_columns,
     order_id_from_link,
 )
 
@@ -202,6 +205,7 @@ def init_db():
         """
     )
     db.execute(CREATE_PENDING_SALES)
+    ensure_pending_sales_columns(db)
     db.execute(CREATE_CLOSED_ORDERS)
     ensure_closed_orders_columns(db)
     db.execute(CREATE_FINISHED_ORDERS)
@@ -219,6 +223,11 @@ def init_db():
         "paid_gems": "INTEGER NOT NULL DEFAULT 0",
         "account_gems": "INTEGER NOT NULL DEFAULT 0",
         "adjust_gems": "INTEGER NOT NULL DEFAULT 0",
+        "before_xp": "INTEGER NOT NULL DEFAULT 0",
+        "paid_xp": "INTEGER NOT NULL DEFAULT 0",
+        "account_xp": "INTEGER NOT NULL DEFAULT 0",
+        "adjust_xp": "INTEGER NOT NULL DEFAULT 0",
+        "xp_per_game": "INTEGER NOT NULL DEFAULT 0",
         "currency": "TEXT NOT NULL DEFAULT 'coins'",
         "created_by_id": "TEXT DEFAULT ''",
         "ping_sent": "INTEGER DEFAULT 0",
@@ -583,26 +592,101 @@ def format_timestamp(dt_str: str) -> str:
         return ""
 
 
+# Валюты заказа. Столбцы в rows: before_<suffix>, paid_<suffix>,
+# account_<suffix>, adjust_<suffix>. Монеты «до» и «оплачено»
+# вводятся в тысячах (scale), гемы и опыт — как есть.
+CURRENCIES = {
+    "coins": {"title": "💰 Монеты", "genitive": "монет", "unit": "к", "scale": 1000},
+    "gems": {"title": "💎 Гемы", "genitive": "гемов", "unit": "", "scale": 1},
+    "xp": {"title": "💠 Опыт", "genitive": "опыта", "unit": "", "scale": 1},
+}
+
+# Марки строки (/order mark)
+MARK_EMOJIS = {
+    "gems": "💎",
+    "coins": "💰",
+    "xp": "💠",
+    "afk": "⏸️",
+    # следующий заказ этого аккаунта ждёт в очереди
+    "next_coins": "⏭️💰",
+    "next_gems": "⏭️💎",
+    "next_xp": "⏭️💠",
+}
+
+
+def add_row_mark(row_id: int, mark: str):
+    row = db.execute("SELECT mark FROM rows WHERE id = ?", (row_id,)).fetchone()
+    marks = [m for m in (row["mark"] or "").split(",") if m.strip()] if row else []
+
+    if mark not in marks:
+        marks.append(mark)
+        db.execute("UPDATE rows SET mark = ? WHERE id = ?", (",".join(marks), row_id))
+        db.commit()
+
+
+def remove_player_mark(player: str, mark: str):
+    """Снимает марку со строк этого игрока (если они ещё в таблице)."""
+    rows = db.execute(
+        "SELECT id, mark FROM rows WHERE player != '' AND LOWER(player) = LOWER(?)",
+        (player,)
+    ).fetchall()
+
+    for row in rows:
+        marks = [m for m in (row["mark"] or "").split(",") if m.strip() and m != mark]
+        db.execute("UPDATE rows SET mark = ? WHERE id = ?", (",".join(marks), row["id"]))
+
+    db.commit()
+
+CURRENCY_CHOICES = [
+    app_commands.Choice(name="Coins", value="coins"),
+    app_commands.Choice(name="Gems", value="gems"),
+    app_commands.Choice(name="XP (опыт)", value="xp"),
+]
+
+
+def row_currency(row) -> str:
+    currency = row["currency"] or "coins"
+    return currency if currency in CURRENCIES else "coins"
+
+
+def order_values(row) -> dict:
+    """Значения заказа строки в её валюте."""
+    currency = row_currency(row)
+    info = CURRENCIES[currency]
+
+    before = row[f"before_{currency}"] or 0
+    paid = row[f"paid_{currency}"] or 0
+    account = row[f"account_{currency}"] or 0
+    adjust = row[f"adjust_{currency}"] or 0
+
+    # Опыт считаем с нуля (бот сам прибавляет опыт за каждую игру),
+    # поэтому цель — только оплаченный опыт
+    goal_base = paid if currency == "xp" else before + paid
+
+    return {
+        "currency": currency,
+        "info": info,
+        "before": before,
+        "paid": paid,
+        "account": account,
+        "adjust": adjust,
+        "balance": account + adjust,
+        "goal": goal_base * info["scale"],
+    }
+
+
 def format_row(row) -> str:
     player = row["player"] or "-"
-    currency = row["currency"] or "coins"
+    values = order_values(row)
 
-    if currency == "gems":
-        before = row["before_gems"] or 0
-        paid = row["paid_gems"] or 0
-        account_balance = row["account_gems"] or 0
-        adjust = row["adjust_gems"] or 0
-        currency_name = "💎 Гемы"
-        unit = ""
-    else:
-        before = row["before_coins"] or 0
-        paid = row["paid_coins"] or 0
-        account_balance = row["account_coins"] or 0
-        adjust = row["adjust_coins"] or 0
-        currency_name = "💰 Монеты"
-        unit = "к"
+    before = values["before"]
+    paid = values["paid"]
+    account_balance = values["account"]
+    adjust = values["adjust"]
+    currency_name = values["info"]["title"]
+    unit = values["info"]["unit"]
 
-    total_balance = account_balance + adjust if account_balance > 0 else "-"
+    total_balance = account_balance + adjust if account_balance > 0 or adjust else "-"
     link = row["link"] or ""
     updated_at = row["account_coins_updated_at"] or row["changed_at"] or ""
 
@@ -619,10 +703,28 @@ def format_row(row) -> str:
     mark = row["mark"] or ""
     if mark:
         marks_list = [m.strip() for m in mark.split(",") if m.strip()]
-        mark_emojis_map = {"gems": "💎", "coins": "💰", "afk": "⏸️"}
-        mark_emoji = " ".join(mark_emojis_map.get(m, "") for m in marks_list if mark_emojis_map.get(m))
+        mark_emoji = " ".join(MARK_EMOJIS[m] for m in marks_list if m in MARK_EMOJIS)
     else:
         mark_emoji = ""
+
+    if values["currency"] == "xp":
+        parts = [
+            f'{row["block_number"]}.{row["row_number"]}. {player}',
+            f"Цель: {paid}",
+            f"{currency_name}: {values['balance']}",
+        ]
+
+        if link:
+            parts.append(f"[{marketplace_name}]({link})")
+
+        if player != "-" and updated_at:
+            parts.append(format_timestamp(updated_at))
+
+        marks = " ".join(item for item in (ping_status, mark_emoji) if item)
+        if marks:
+            parts.append(marks)
+
+        return " | ".join(parts)
 
     return (
         f'{row["block_number"]}.{row["row_number"]}. '
@@ -726,8 +828,9 @@ def parse_match_won(message: discord.Message):
     coins = parse_coins(coins_raw) if coins_raw else None
     gems = parse_coins(gems_raw) if gems_raw else None
 
-    if not player or (coins is None and gems is None):
-        print("Не удалось найти Player и Coins/Gems.")
+    # Coins/Gems может не быть: для фарма опыта нужен только ник
+    if not player:
+        print("Не удалось найти Player.")
         print("Полученный текст:")
         print(full_text)
         return None
@@ -752,6 +855,11 @@ def clear_row_by_id(row_id: int, reason: str = "Очистка по реакци
             account_coins_updated_at = ?,
             adjust_coins = 0,
             adjust_gems = 0,
+            before_xp = 0,
+            paid_xp = 0,
+            account_xp = 0,
+            adjust_xp = 0,
+            xp_per_game = 0,
             link = '',
             changed = 1,
             changed_by = ?,
@@ -863,12 +971,9 @@ async def check_and_notify(row_id: int):
         print(f"[check_and_notify] Строка {row_id} не найдена")
         return
 
-    if (row["currency"] or "coins") == "gems":
-        total = row["before_gems"] + row["paid_gems"]
-        currency_name = "гемов"
-    else:
-        total = (row["before_coins"] + row["paid_coins"]) * 1000
-        currency_name = "монет"
+    values = order_values(row)
+    total = values["goal"]
+    currency_name = values["info"]["genitive"]
 
     print(f"[check_and_notify] total target = {total} {currency_name}")
 
@@ -876,10 +981,7 @@ async def check_and_notify(row_id: int):
         print("[check_and_notify] total <= 0, уведомление не требуется")
         return
 
-    if (row["currency"] or "coins") == "gems":
-        total_balance = (row["account_gems"] or 0) + (row["adjust_gems"] or 0)
-    else:
-        total_balance = (row["account_coins"] or 0) + (row["adjust_coins"] or 0)
+    total_balance = values["balance"]
 
     ping_sent = row["ping_sent"] or 0
     print(f"[check_and_notify] total_balance (account+adjust) = {total_balance}, ping_sent = {ping_sent}")
@@ -925,16 +1027,43 @@ async def finish_farm(row, total_balance, total, currency_name: str):
         "Аккаунт убран из таблицы, строка свободна.",
     ]
 
-    if link:
+    if order_id:
+        lines.append(f"Заказ: [#{order_id}](<{sale_link(order_id)}>)")
+    elif link:
         lines.append(f"Заказ: <{link}>")
+
+    # Следующие заказы этого аккаунта, ждущие в очереди
+    with use_guild(None):
+        queued = db.execute(
+            """
+            SELECT *
+            FROM pending_sales
+            WHERE status = 'queued' AND LOWER(player) = LOWER(?)
+            ORDER BY created_at
+            """,
+            (row["player"],)
+        ).fetchall()
+
+    view = None
+
+    if queued:
+        view = discord.ui.View(timeout=None)
+        for sale in queued:
+            view.add_item(SaleButton("start", sale["order_id"]))
+            lines.append(
+                f"⏭️ Следующий заказ: {CURRENCIES[queued_form(sale)['currency']]['title']} "
+                f"[#{sale['order_id']}](<{sale_link(sale['order_id'])}>) — нажмите «▶️ Начать»."
+            )
 
     if order_id:
         lines.append("Сообщение удалится, когда покупатель подтвердит заказ.")
 
     try:
+        send_kwargs = {"view": view} if view else {}
         msg = await channel.send(
             "\n".join(lines),
-            allowed_mentions=discord.AllowedMentions.all()
+            allowed_mentions=discord.AllowedMentions.all(),
+            **send_kwargs
         )
         await msg.add_reaction("✅")
     except Exception as e:
@@ -992,7 +1121,17 @@ async def process_closed_orders():
 
         # Продажа ещё не записана в таблицу — закрываем её карточку
         sale = get_pending_sale(order_id)
-        if sale is not None and sale["status"] == "new":
+        if sale is not None and sale["status"] in ("new", "queued"):
+            if sale["status"] == "queued":
+                form = queued_form(sale)
+                for guild_id in known_guild_ids():
+                    with use_guild(guild_id):
+                        remove_player_mark(sale["player"], f"next_{form.get('currency', 'coins')}")
+                        try:
+                            await update_table_messages()
+                        except Exception as error:
+                            print(f"[closed_orders] Ошибка обновления таблицы: {error}")
+
             update_pending_sale(order_id, status=reason, done_by="FunPay")
             await archive_sale_card(get_pending_sale(order_id))
 
@@ -1185,9 +1324,17 @@ async def update_coins_from_match(message: discord.Message):
         )
         return False
 
-    currency = row["currency"] or "coins"
+    currency = row_currency(row)
 
-    if currency == "gems":
+    if currency == "xp":
+        # Опыт в сообщении не пишется: за каждую игру добавляем
+        # заданное количество (/order xp или поле в форме продажи)
+        xp_per_game = row["xp_per_game"] or 0
+        if xp_per_game <= 0:
+            print(f"Для игрока {player} выбран опыт, но не задан опыт за игру (/order xp).")
+            return False
+        value = (row["account_xp"] or 0) + xp_per_game
+    elif currency == "gems":
         if gems is None:
             print(f"Для игрока {player} выбраны Gems, но Gems в сообщении не найдены.")
             return False
@@ -1201,44 +1348,24 @@ async def update_coins_from_match(message: discord.Message):
     now_iso = datetime.now(timezone.utc).isoformat()
     stale_msg_id = row["last_stale_message_id"]
 
-    if currency == "gems":
-        db.execute(
-            """
-            UPDATE rows
-            SET account_gems = ?,
-                account_coins_updated_at = ?,
-                changed_by = ?,
-                changed_at = ?,
-                changed = 1
-            WHERE id = ?
-            """,
-            (
-                value,
-                now_iso,
-                "Match Won Bot",
-                now_iso,
-                row["id"]
-            )
+    db.execute(
+        f"""
+        UPDATE rows
+        SET account_{currency} = ?,
+            account_coins_updated_at = ?,
+            changed_by = ?,
+            changed_at = ?,
+            changed = 1
+        WHERE id = ?
+        """,
+        (
+            value,
+            now_iso,
+            "Match Won Bot",
+            now_iso,
+            row["id"]
         )
-    else:
-        db.execute(
-            """
-            UPDATE rows
-            SET account_coins = ?,
-                account_coins_updated_at = ?,
-                changed_by = ?,
-                changed_at = ?,
-                changed = 1
-            WHERE id = ?
-            """,
-            (
-                value,
-                now_iso,
-                "Match Won Bot",
-                now_iso,
-                row["id"]
-            )
-        )
+    )
 
     db.commit()
 
@@ -1491,17 +1618,15 @@ order_group = app_commands.Group(
 
 
 @order_group.command(name="add", description="Добавить заказ")
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Coins", value="coins"),
-    app_commands.Choice(name="Gems", value="gems"),
-])
+@app_commands.choices(currency=CURRENCY_CHOICES)
 @app_commands.describe(
     row="Номер строки, например 1.1",
     player="Ник игрока",
-    before="Количество валюты до заказа",
+    before="Количество валюты до заказа (для XP не нужно — укажите 0)",
     paid="Количество оплаченной валюты",
-    currency="Валюта: Coins или Gems",
-    link="Ссылка на заказ"
+    currency="Валюта: Coins, Gems или XP",
+    link="Ссылка на заказ",
+    xp_per_game="Только для XP: сколько опыта даёт одна игра"
 )
 async def order_add(
     interaction: discord.Interaction,
@@ -1510,7 +1635,8 @@ async def order_add(
     before: int,
     paid: int,
     currency: str = "coins",
-    link: str = ""
+    link: str = "",
+    xp_per_game: int = 0
 ):
     if not can_use_order(interaction):
         return await deny(interaction)
@@ -1531,9 +1657,16 @@ async def order_add(
             "Эта строка уже занята. Используйте /order change для изменения данных."
         )
 
-    fill_order_row(target["id"], player, before, paid, currency, link, interaction.user)
+    fill_order_row(target["id"], player, before, paid, currency, link, interaction.user, xp_per_game)
 
     await update_table_messages()
+
+    if currency == "xp" and xp_per_game <= 0:
+        return await send_result(
+            interaction,
+            "Заказ добавлен. Укажите, сколько опыта даёт игра: /order xp."
+        )
+
     await send_result(interaction, "Заказ добавлен.")
 
 
@@ -1565,7 +1698,7 @@ def first_free_row():
     ).fetchone()
 
 
-def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: str, user):
+def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: str, user, xp_per_game: int = 0):
     """Записывает новый заказ в пустую строку."""
     now_iso = datetime.now(timezone.utc).isoformat()
     db.execute(
@@ -1582,6 +1715,11 @@ def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: 
             account_coins_updated_at = ?,
             adjust_coins = 0,
             adjust_gems = ?,
+            before_xp = ?,
+            paid_xp = ?,
+            account_xp = ?,
+            adjust_xp = 0,
+            xp_per_game = ?,
             link = ?,
             changed = 1,
             changed_by = ?,
@@ -1603,6 +1741,11 @@ def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: 
             currency,
             now_iso,
             0,
+            0,
+            paid if currency == "xp" else 0,
+            # Опыт считаем сами с нуля: + опыт за каждую игру
+            0,
+            xp_per_game if currency == "xp" else 0,
             link,
             str(user),
             now_iso,
@@ -1614,10 +1757,7 @@ def fill_order_row(row_id: int, player: str, before, paid, currency: str, link: 
 
 
 @order_group.command(name="change", description="Изменить заказ")
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Coins", value="coins"),
-    app_commands.Choice(name="Gems", value="gems"),
-])
+@app_commands.choices(currency=CURRENCY_CHOICES)
 @app_commands.describe(
     row="Номер строки, например 1.1",
     player="Ник игрока",
@@ -1663,6 +1803,7 @@ async def order_change(
         or (paid if currency == "coins" else 0) != target["paid_coins"]
         or (before if currency == "gems" else 0) != target["before_gems"]
         or (paid if currency == "gems" else 0) != target["paid_gems"]
+        or (paid if currency == "xp" else 0) != target["paid_xp"]
     ):
         reset_ping = True
 
@@ -1677,6 +1818,8 @@ async def order_change(
                 paid_coins = ?,
                 before_gems = ?,
                 paid_gems = ?,
+                before_xp = ?,
+                paid_xp = ?,
                 currency = ?,
                 link = ?,
                 changed = 1,
@@ -1692,6 +1835,8 @@ async def order_change(
                 paid if currency == "coins" else 0,
                 before if currency == "gems" else 0,
                 paid if currency == "gems" else 0,
+                0,
+                paid if currency == "xp" else 0,
                 currency,
                 link,
                 str(interaction.user),
@@ -1746,6 +1891,11 @@ async def order_delete(
             account_coins_updated_at = ?,
             adjust_coins = 0,
             adjust_gems = 0,
+            before_xp = 0,
+            paid_xp = 0,
+            account_xp = 0,
+            adjust_xp = 0,
+            xp_per_game = 0,
             link = '',
             changed = 1,
             changed_by = ?,
@@ -1788,15 +1938,10 @@ async def order_finish(
         await send_result(interaction, "Строка пуста. Нечего завершать.")
         return
 
-    currency = target["currency"] or "coins"
-    if currency == "gems":
-        total = (target["before_gems"] + target["paid_gems"]) * 1000
-        total_balance = (target["account_gems"] or 0) + (target["adjust_gems"] or 0)
-        currency_name = "гемов"
-    else:
-        total = (target["before_coins"] + target["paid_coins"]) * 1000
-        total_balance = (target["account_coins"] or 0) + (target["adjust_coins"] or 0)
-        currency_name = "монет"
+    values = order_values(target)
+    total = values["goal"]
+    total_balance = values["balance"]
+    currency_name = values["info"]["genitive"]
     new_total = total_balance - total
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -1813,6 +1958,11 @@ async def order_finish(
             account_coins_updated_at = ?,
             adjust_coins = 0,
             adjust_gems = 0,
+            before_xp = 0,
+            paid_xp = 0,
+            account_xp = 0,
+            adjust_xp = 0,
+            xp_per_game = 0,
             player = '',
             before_coins = 0,
             paid_coins = 0,
@@ -1853,20 +2003,17 @@ async def order_finish(
 
 
 @order_group.command(name="adjust", description="Изменить ручной баланс валюты")
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Coins", value="coins"),
-    app_commands.Choice(name="Gems", value="gems"),
-])
+@app_commands.choices(currency=CURRENCY_CHOICES)
 @app_commands.describe(
     row="Номер строки, например 1.1",
-    amount="Количество тысяч валюты (положительное - добавить, отрицательное - вычесть)",
-    currency="Валюта: Coins или Gems"
+    amount="Монеты — в тысячах, гемы и опыт — в единицах (+ добавить, - вычесть)",
+    currency="Валюта (по умолчанию — валюта строки)"
 )
 async def order_adjust(
     interaction: discord.Interaction,
     row: str,
     amount: int,
-    currency: str = "coins"
+    currency: Optional[str] = None
 ):
     if not can_use_order(interaction):
         return await deny(interaction)
@@ -1878,52 +2025,42 @@ async def order_adjust(
         await send_result(interaction, "Ошибка: указанная строка не существует.")
         return
 
-    if (target["currency"] or "coins") != currency:
-        selected = "Gems" if (target["currency"] or "coins") == "gems" else "Coins"
+    if not target["player"]:
+        await send_result(interaction, "Строка пуста: в ней нет заказа.")
+        return
+
+    # Валюту можно не выбирать — берётся валюта строки
+    currency = currency or row_currency(target)
+
+    if row_currency(target) != currency:
+        selected = CURRENCIES[row_currency(target)]["title"]
         await send_result(interaction,
             f"Ошибка: в строке выбрана валюта {selected}."
         )
         return
 
-    current_adjust = (
-        target["adjust_gems"] if currency == "gems"
-        else target["adjust_coins"]
-    ) or 0
+    current_adjust = target[f"adjust_{currency}"] or 0
 
-    delta = amount * 1000
+    # Монеты — в тысячах, гемы и опыт — в единицах
+    delta = amount * 1000 if currency == "coins" else amount
     new_adjust = current_adjust + delta
 
     now_iso = datetime.now(timezone.utc).isoformat()
     stale_msg_id = target["last_stale_message_id"]
 
-    if currency == "gems":
-        db.execute(
-            """
-            UPDATE rows
-            SET adjust_gems = ?,
-                account_coins_updated_at = ?,
-                changed = 1,
-                changed_by = ?,
-                changed_at = ?,
-                ping_sent = 0
-            WHERE id = ?
-            """,
-            (new_adjust, now_iso, str(interaction.user), now_iso, target["id"])
-        )
-    else:
-        db.execute(
-            """
-            UPDATE rows
-            SET adjust_coins = ?,
-                account_coins_updated_at = ?,
-                changed = 1,
-                changed_by = ?,
-                changed_at = ?,
-                ping_sent = 0
-            WHERE id = ?
-            """,
-            (new_adjust, now_iso, str(interaction.user), now_iso, target["id"])
-        )
+    db.execute(
+        f"""
+        UPDATE rows
+        SET adjust_{currency} = ?,
+            account_coins_updated_at = ?,
+            changed = 1,
+            changed_by = ?,
+            changed_at = ?,
+            ping_sent = 0
+        WHERE id = ?
+        """,
+        (new_adjust, now_iso, str(interaction.user), now_iso, target["id"])
+    )
 
     db.commit()
 
@@ -1935,8 +2072,47 @@ async def order_adjust(
     await check_and_notify(target["id"])
 
     await send_result(interaction,
-        f"Ручной баланс {currency} изменён: {current_adjust} -> {new_adjust} (изменение на {delta})."
+        f"Ручной баланс ({CURRENCIES[currency]['title']}) строки {row} изменён: "
+        f"{format_big(current_adjust)} → {format_big(new_adjust)} ({delta:+})."
     )
+
+
+@order_group.command(name="xp", description="Сколько опыта даёт одна игра (для заказа на опыт)")
+@app_commands.describe(
+    row="Номер строки, например 1.1",
+    amount="Опыт за одну игру"
+)
+async def order_xp(
+    interaction: discord.Interaction,
+    row: str,
+    amount: int
+):
+    if not can_use_order(interaction):
+        return await deny(interaction)
+
+    await interaction.response.defer(ephemeral=True)
+
+    target = get_row(row)
+    if not target:
+        return await send_result(interaction, "Ошибка: указанная строка не существует.")
+
+    if row_currency(target) != "xp":
+        return await send_result(
+            interaction,
+            "В этой строке не опыт. Сначала выберите валюту XP: /order change."
+        )
+
+    if amount < 0:
+        return await send_result(interaction, "Опыт за игру не может быть отрицательным.")
+
+    db.execute(
+        "UPDATE rows SET xp_per_game = ? WHERE id = ?",
+        (amount, target["id"])
+    )
+    db.commit()
+
+    await update_table_messages()
+    await send_result(interaction, f"Строка {row}: за каждую игру +{amount} опыта.")
 
 
 @order_group.command(name="ping-add", description="Добавить пользователей в глобальный список для пинга")
@@ -2015,15 +2191,16 @@ async def order_ping_list(interaction: discord.Interaction):
     await send_result(interaction, f"Глобальные пользователи для пинга: {mentions}")
 
 
-@order_group.command(name="mark", description="Добавить или удалить статус строки: gems, coins или afk")
+@order_group.command(name="mark", description="Добавить или удалить статус строки: gems, coins, xp или afk")
 @app_commands.choices(mark=[
     app_commands.Choice(name="Gems", value="gems"),
     app_commands.Choice(name="Coins", value="coins"),
+    app_commands.Choice(name="XP (опыт)", value="xp"),
     app_commands.Choice(name="AFK", value="afk"),
 ])
 @app_commands.describe(
     row="Номер строки, например 1.1",
-    mark="Статус: gems, coins или afk"
+    mark="Статус: gems, coins, xp или afk"
 )
 async def order_mark(
     interaction: discord.Interaction,
@@ -2045,8 +2222,7 @@ async def order_mark(
     current_mark = target["mark"] or ""
     marks_list = [m.strip() for m in current_mark.split(",") if m.strip()]
     
-    mark_emojis_map = {"gems": "💎", "coins": "💰", "afk": "⏸️"}
-    emoji = mark_emojis_map.get(mark, "")
+    emoji = MARK_EMOJIS.get(mark, "")
 
     if mark in marks_list:
         marks_list.remove(mark)
@@ -2523,6 +2699,9 @@ def parse_currency(text: str) -> Optional[str]:
     if value in ("gems", "gem", "гемы", "гем", "г", "g"):
         return "gems"
 
+    if value in ("xp", "exp", "опыт", "о"):
+        return "xp"
+
     return None
 
 
@@ -2532,7 +2711,7 @@ def sale_paid_text(sale) -> Optional[str]:
     if not amount:
         return None
 
-    if sale["currency"] == "gems":
+    if sale["currency"] in ("gems", "xp"):
         return str(amount)
 
     # Монеты в таблице хранятся в тысячах: 50 000 шт. -> 50
@@ -2540,13 +2719,17 @@ def sale_paid_text(sale) -> Optional[str]:
 
 
 def build_sale_embed(sale) -> discord.Embed:
-    gems = sale["currency"] == "gems"
+    currency_label = {
+        "coins": "💰 монеты",
+        "gems": "💎 гемы",
+        "xp": "💠 опыт",
+    }.get(sale["currency"], "💰 монеты")
     status = sale["status"]
 
     embed = discord.Embed(
         title=f"🛒 Продажа #{sale['order_id']}",
         url=sale_link(sale["order_id"]),
-        color=0x2ECC71 if status == "new" else 0x95A5A6
+        color={"new": 0x2ECC71, "queued": 0xE67E22}.get(status, 0x95A5A6)
     )
 
     amount = f"{sale['amount']:,}".replace(",", " ") if sale["amount"] else "?"
@@ -2554,7 +2737,7 @@ def build_sale_embed(sale) -> discord.Embed:
     embed.add_field(name="Покупатель", value=sale["buyer"] or "—")
     embed.add_field(
         name="Количество",
-        value=f"{amount} шт. ({'💎 гемы' if gems else '💰 монеты'})"
+        value=f"{amount} шт. ({currency_label})"
     )
     embed.add_field(name="Сумма", value=sale["price"] or "—")
     embed.add_field(
@@ -2563,7 +2746,12 @@ def build_sale_embed(sale) -> discord.Embed:
         inline=False
     )
 
-    if status == "added":
+    if status == "queued":
+        embed.set_footer(
+            text=f"⏳ В очереди за строкой {sale['row_name']}: нажмите «▶️ Начать», "
+                 f"когда закончится текущий фарм этого аккаунта"
+        )
+    elif status == "added":
         embed.set_footer(text=f"✅ Записано в строку {sale['row_name']} — {sale['done_by']}")
     elif status == "skipped":
         embed.set_footer(text=f"Пропущено — {sale['done_by']}")
@@ -2575,11 +2763,72 @@ def build_sale_embed(sale) -> discord.Embed:
     return embed
 
 
-def sale_view(order_id: str) -> discord.ui.View:
+def sale_view(order_id: str, queued: bool = False) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(SaleButton("add", order_id))
+    view.add_item(SaleButton("start" if queued else "add", order_id))
     view.add_item(SaleButton("skip", order_id))
     return view
+
+
+async def update_finish_messages(player: str):
+    """
+    Следующий заказ аккаунта начат или пропущен: сообщение «завершил фарм»
+    с кнопкой «▶️ Начать» больше не нужно. Если в очереди остались другие
+    заказы этого аккаунта — оставляем только их кнопки.
+    """
+    with use_guild(None):
+        remaining = db.execute(
+            """
+            SELECT order_id
+            FROM pending_sales
+            WHERE status = 'queued' AND LOWER(player) = LOWER(?)
+            ORDER BY created_at
+            """,
+            (player,)
+        ).fetchall()
+
+    notices = db.execute(
+        """
+        SELECT *
+        FROM finished_orders
+        WHERE message_id != 0 AND LOWER(player) = LOWER(?)
+        """,
+        (player,)
+    ).fetchall()
+
+    for notice in notices:
+        if remaining:
+            view = discord.ui.View(timeout=None)
+            for item in remaining:
+                view.add_item(SaleButton("start", item["order_id"]))
+
+            try:
+                channel = bot.get_channel(notice["channel_id"])
+                if channel is None:
+                    channel = await bot.fetch_channel(notice["channel_id"])
+                await channel.get_partial_message(notice["message_id"]).edit(view=view)
+            except discord.HTTPException as error:
+                print(f"[sales] Не удалось обновить кнопки сообщения {notice['message_id']}: {error}")
+            continue
+
+        await delete_bot_message(notice["channel_id"], notice["message_id"])
+
+        # Запись оставляем: по ней покупателю на FunPay уходит сообщение
+        # о конце фарма, если ещё не ушло
+        db.execute(
+            "UPDATE finished_orders SET message_id = 0 WHERE id = ?",
+            (notice["id"],)
+        )
+
+    db.commit()
+
+
+def queued_form(sale) -> dict:
+    """Данные формы, сохранённые для заказа в очереди."""
+    try:
+        return json.loads(sale["form_data"] or "{}")
+    except (TypeError, ValueError):
+        return {}
 
 
 async def edit_sale_card(sale, with_buttons: bool):
@@ -2593,7 +2842,7 @@ async def edit_sale_card(sale, with_buttons: bool):
 
         await channel.get_partial_message(sale["card_message_id"]).edit(
             embed=build_sale_embed(sale),
-            view=sale_view(sale["order_id"]) if with_buttons else None
+            view=sale_view(sale["order_id"], sale["status"] == "queued") if with_buttons else None
         )
     except discord.HTTPException as error:
         print(f"[sales] Не удалось обновить карточку #{sale['order_id']}: {error}")
@@ -2625,7 +2874,7 @@ async def archive_sale_card(sale):
 
 class SaleButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"sale:(?P<action>add|skip):(?P<order_id>[A-Za-z0-9]+)"
+    template=r"sale:(?P<action>add|skip|start):(?P<order_id>[A-Za-z0-9]+)"
 ):
     """Кнопки карточки. Работают и после перезапуска бота."""
 
@@ -2636,6 +2885,13 @@ class SaleButton(
                 emoji="➕",
                 style=discord.ButtonStyle.success,
                 custom_id=f"sale:add:{order_id}"
+            )
+        elif action == "start":
+            button = discord.ui.Button(
+                label=f"Начать #{order_id}",
+                emoji="▶️",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"sale:start:{order_id}"
             )
         else:
             button = discord.ui.Button(
@@ -2664,13 +2920,24 @@ class SaleButton(
 
         sale = get_pending_sale(self.order_id)
 
-        if sale is None or sale["status"] != "new":
+        allowed = {
+            "add": ("new",),
+            "start": ("queued",),
+            "skip": ("new", "queued"),
+        }[self.action]
+
+        if sale is None or sale["status"] not in allowed:
             return await interaction.response.send_message(
                 "Эта продажа уже обработана.",
                 ephemeral=True
             )
 
         if self.action == "skip":
+            if sale["status"] == "queued":
+                form = queued_form(sale)
+                remove_player_mark(sale["player"], f"next_{form.get('currency', 'coins')}")
+                await update_table_messages()
+
             update_pending_sale(
                 self.order_id,
                 status="skipped",
@@ -2678,6 +2945,9 @@ class SaleButton(
             )
             await interaction.response.defer()
             await archive_sale_card(get_pending_sale(self.order_id))
+
+            if sale["status"] == "queued":
+                await update_finish_messages(sale["player"])
             return
 
         await interaction.response.send_modal(SaleModal(sale))
@@ -2685,40 +2955,59 @@ class SaleButton(
 
 class SaleModal(discord.ui.Modal):
     def __init__(self, sale):
-        super().__init__(title=f"Заказ #{sale['order_id']} в таблицу", timeout=600)
+        # Заказ из очереди: подставляем данные, сохранённые из первой формы
+        self.from_queue = sale["status"] == "queued"
+        form = queued_form(sale) if self.from_queue else {}
+        currency = form.get("currency") or sale["currency"]
+
+        title = f"Начать заказ #{sale['order_id']}" if self.from_queue else f"Заказ #{sale['order_id']} в таблицу"
+        super().__init__(title=title, timeout=600)
 
         self.order_id = sale["order_id"]
-        unit = "" if sale["currency"] == "gems" else " (в тысячах)"
+        self.is_xp = currency == "xp"
+        unit = " (в тысячах)" if currency == "coins" else ""
 
         self.player = discord.ui.TextInput(
             label="Ник в игре",
-            default=sale["player"] or None,
+            default=form.get("player") or sale["player"] or None,
             max_length=100
         )
         self.paid = discord.ui.TextInput(
             label=f"Оплачено{unit}",
-            default=sale_paid_text(sale),
+            default=form.get("paid") or sale_paid_text(sale),
             max_length=20
         )
-        self.before = discord.ui.TextInput(
+        # Опыт считается с нуля — «До заказа» для него не нужно
+        self.before = None if self.is_xp else discord.ui.TextInput(
             label=f"До заказа{unit}",
             placeholder="Баланс аккаунта до заказа",
+            default=form.get("before") or None,
             max_length=20
         )
-        self.currency = discord.ui.TextInput(
-            label="Валюта: coins или gems",
-            default=sale["currency"],
-            max_length=10
-        )
+        if self.is_xp:
+            self.currency = discord.ui.TextInput(
+                label="Опыт за одну игру",
+                placeholder="например 150",
+                default=form.get("xp_per_game") or None,
+                max_length=10
+            )
+        else:
+            self.currency = discord.ui.TextInput(
+                label="Валюта: coins, gems или xp",
+                default=currency,
+                max_length=10
+            )
         self.row = discord.ui.TextInput(
             label="Строка (пусто — первая свободная)",
             placeholder="например 1.2",
+            default=form.get("row_name") or None,
             required=False,
             max_length=10
         )
 
         for item in (self.player, self.paid, self.before, self.currency, self.row):
-            self.add_item(item)
+            if item is not None:
+                self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
         current_guild_id.set(interaction.guild_id)
@@ -2727,25 +3016,52 @@ class SaleModal(discord.ui.Modal):
             await interaction.response.send_message(text, ephemeral=True)
 
         sale = get_pending_sale(self.order_id)
+        expected_status = "queued" if self.from_queue else "new"
 
-        if sale is None or sale["status"] != "new":
+        if sale is None or sale["status"] != expected_status:
             return await fail("Эта продажа уже обработана.")
 
         player = self.player.value.strip()
         if not player:
             return await fail("Укажите ник в игре.")
 
-        currency = parse_currency(self.currency.value)
-        if currency is None:
-            return await fail("Валюта должна быть coins или gems.")
+        xp_per_game = 0
+
+        if self.is_xp:
+            currency = "xp"
+            try:
+                xp_per_game = int(parse_amount(self.currency.value))
+            except ValueError:
+                return await fail("«Опыт за одну игру» должен быть числом.")
+        else:
+            currency = parse_currency(self.currency.value)
+            if currency is None:
+                return await fail("Валюта должна быть coins, gems или xp.")
 
         try:
             paid = parse_amount(self.paid.value)
-            before = parse_amount(self.before.value)
+            before = parse_amount(self.before.value) if self.before else 0
         except ValueError:
             return await fail("«Оплачено» и «До заказа» должны быть числами.")
 
         row_name = self.row.value.strip()
+
+        # У этого аккаунта уже идёт фарм — ставим заказ в очередь
+        if not row_name and not self.from_queue:
+            active = db.execute(
+                """
+                SELECT *
+                FROM rows
+                WHERE player != '' AND LOWER(player) = LOWER(?)
+                LIMIT 1
+                """,
+                (player,)
+            ).fetchone()
+
+            if active:
+                return await self.queue_order(
+                    interaction, sale, active, player, before, paid, currency, xp_per_game
+                )
 
         if row_name:
             target = get_row(row_name)
@@ -2759,7 +3075,28 @@ class SaleModal(discord.ui.Modal):
         row_name = f"{target['block_number']}.{target['row_number']}"
 
         if is_row_filled(target):
-            return await fail(f"Строка {row_name} уже занята.")
+            same_account = (target["player"] or "").lower() == player.lower()
+            saved_row = queued_form(sale).get("row_name") if self.from_queue else None
+
+            if self.from_queue and same_account:
+                return await fail(
+                    f"В строке {row_name} у {player} ещё идёт фарм "
+                    f"({CURRENCIES[row_currency(target)]['title']}). Нажмите «▶️ Начать», "
+                    f"когда он закончится, или очистите поле «Строка», чтобы начать "
+                    f"в свободной строке."
+                )
+
+            if self.from_queue and row_name == saved_row:
+                # Освободившуюся строку уже занял другой заказ — берём свободную
+                target = first_free_row()
+                if not target:
+                    return await fail(
+                        f"Строку {row_name} уже занял другой заказ, а свободных строк нет. "
+                        f"Добавьте строку: /menu add-row."
+                    )
+                row_name = f"{target['block_number']}.{target['row_number']}"
+            else:
+                return await fail(f"Строка {row_name} уже занята.")
 
         await interaction.response.defer(ephemeral=True)
 
@@ -2770,8 +3107,20 @@ class SaleModal(discord.ui.Modal):
             paid,
             currency,
             sale_link(self.order_id),
-            interaction.user
+            interaction.user,
+            xp_per_game
         )
+
+        # Привязка к чату покупателя: сообщение о конце фарма на FunPay
+        if sale["chat_id"]:
+            db.execute(
+                "UPDATE rows SET chat_id = ? WHERE id = ?",
+                (sale["chat_id"], target["id"])
+            )
+            db.commit()
+
+        if self.from_queue:
+            remove_player_mark(player, f"next_{currency}")
 
         update_pending_sale(
             self.order_id,
@@ -2782,8 +3131,48 @@ class SaleModal(discord.ui.Modal):
         )
         await archive_sale_card(get_pending_sale(self.order_id))
 
+        if self.from_queue:
+            await update_finish_messages(sale["player"] or player)
+
         await update_table_messages()
         await send_result(interaction, f"Заказ #{self.order_id} записан в строку {row_name}.")
+
+    async def queue_order(self, interaction, sale, active, player, before, paid, currency, xp_per_game):
+        """
+        Второй заказ того же аккаунта: данные формы сохраняются, строке
+        ставится марка ⏭️, а начать заказ можно кнопкой «▶️ Начать»
+        на карточке или на сообщении о конце текущего фарма.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        active_name = f"{active['block_number']}.{active['row_number']}"
+        form = {
+            "player": player,
+            "paid": format_amount(paid),
+            "before": format_amount(before),
+            "currency": currency,
+            "xp_per_game": str(xp_per_game) if xp_per_game else "",
+            "row_name": active_name,
+        }
+
+        update_pending_sale(
+            self.order_id,
+            status="queued",
+            player=player,
+            done_by=str(interaction.user),
+            row_name=active_name,
+            form_data=json.dumps(form, ensure_ascii=False)
+        )
+
+        add_row_mark(active["id"], f"next_{currency}")
+        await edit_sale_card(get_pending_sale(self.order_id), with_buttons=True)
+        await update_table_messages()
+
+        await send_result(
+            interaction,
+            f"У {player} уже идёт фарм в строке {active_name}. Заказ #{self.order_id} "
+            f"поставлен в очередь: нажмите «▶️ Начать», когда текущий фарм закончится."
+        )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"[sales] Ошибка формы #{self.order_id}: {error!r}")

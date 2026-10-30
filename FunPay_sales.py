@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS pending_sales (
     card_player TEXT NOT NULL DEFAULT '',
     done_by TEXT NOT NULL DEFAULT '',
     row_name TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT ''
+    created_at TEXT NOT NULL DEFAULT '',
+    form_data TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -64,6 +65,20 @@ CLOSE_REASONS = {
     "closed_by_admin": "Заказ подтверждён администратором",
     "refunded": "Возврат по заказу",
 }
+
+
+def ensure_pending_sales_columns(connection) -> None:
+    """
+    form_data — данные формы заказа, поставленного в очередь
+    (у того же аккаунта уже идёт фарм). В базе от прошлой версии
+    этого столбца нет.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(pending_sales)")}
+
+    if "form_data" not in columns:
+        connection.execute(
+            "ALTER TABLE pending_sales ADD COLUMN form_data TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def ensure_closed_orders_columns(connection) -> None:
@@ -105,6 +120,7 @@ def order_id_from_link(link: str) -> str:
 def connect() -> sqlite3.Connection:
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.execute(CREATE_PENDING_SALES)
+    ensure_pending_sales_columns(connection)
     connection.execute(CREATE_CLOSED_ORDERS)
     ensure_closed_orders_columns(connection)
     return connection
@@ -117,7 +133,13 @@ def parse_sale_title(title: str) -> tuple[str, int]:
     """
 
     upper_title = (title or "").upper()
-    currency = "gems" if "ГЕМ" in upper_title else "coins"
+
+    if "ОПЫТ" in upper_title or re.search(r"\b(XP|EXP)\b", upper_title):
+        currency = "xp"
+    elif "ГЕМ" in upper_title:
+        currency = "gems"
+    else:
+        currency = "coins"
 
     match = re.search(r"(\d[\d\s ]*)\s*шт\.?\s*$", title or "")
     amount = int(re.sub(r"\D", "", match.group(1))) if match else 0

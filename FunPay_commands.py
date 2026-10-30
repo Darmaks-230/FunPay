@@ -111,6 +111,10 @@ def prepare_database(database_path: Path = DATABASE_PATH):
             ("paid_gems", "INTEGER DEFAULT 0"),
             ("account_gems", "INTEGER DEFAULT 0"),
             ("adjust_gems", "INTEGER DEFAULT 0"),
+            ("before_xp", "INTEGER DEFAULT 0"),
+            ("paid_xp", "INTEGER DEFAULT 0"),
+            ("account_xp", "INTEGER DEFAULT 0"),
+            ("adjust_xp", "INTEGER DEFAULT 0"),
             ("currency", "TEXT DEFAULT 'coins'"),
         ):
             if column not in columns:
@@ -220,6 +224,10 @@ def get_account_data(player_name: str) -> dict | None:
                         adjust_gems,
                         before_gems,
                         paid_gems,
+                        before_xp,
+                        paid_xp,
+                        account_xp,
+                        adjust_xp,
                         currency,
                         chat_id,
                         farm_finished
@@ -248,13 +256,26 @@ def get_account_data(player_name: str) -> dict | None:
 # Расчёт баланса и прогресса
 # =================================================
 
+# Названия валют: (значок, «Монеты», «монет»)
+CURRENCY_NAMES = {
+    "coins": ("💰", "Монеты", "монет"),
+    "gems": ("💎", "Гемы", "гемов"),
+    "xp": ("💠", "Опыт", "опыта"),
+}
+
+
+def currency_names(currency: str):
+    return CURRENCY_NAMES.get(currency, CURRENCY_NAMES["coins"])
+
+
 def calculate_progress(data: dict):
     currency = (data.get("currency") or "coins").lower()
-    if currency == "gems":
-        account = data.get("account_gems") or 0
-        adjust = data.get("adjust_gems") or 0
-        before = data.get("before_gems") or 0
-        paid = data.get("paid_gems") or 0
+    if currency in ("gems", "xp"):
+        account = data.get(f"account_{currency}") or 0
+        adjust = data.get(f"adjust_{currency}") or 0
+        # Опыт считается с нуля: цель — только оплаченный опыт
+        before = 0 if currency == "xp" else data.get("before_gems") or 0
+        paid = data.get(f"paid_{currency}") or 0
     else:
         currency = "coins"
         account = data.get("account_coins") or 0
@@ -273,7 +294,7 @@ def calculate_progress(data: dict):
 
 def get_farm_status(total: int, goal: int, currency: str) -> str:
     if goal > 0 and total >= goal:
-        name = "гемов" if currency == "gems" else "монет"
+        name = currency_names(currency)[2]
         return f"\n\n✅ Фарм закончен!\n🎉 Цель по {name} достигнута."
     return ""
 
@@ -340,7 +361,8 @@ async def money_command(message: Message):
 
 
     total, goal, progress, currency = calculate_progress(data)
-    currency_name = "💎 Гемы" if currency == "gems" else "💰 Монеты"
+    icon, title, _ = currency_names(currency)
+    currency_name = f"{icon} {title}"
     await message.reply(text=f"{currency_name} игрока {player_name}: {total:,}")
 
 
@@ -410,14 +432,15 @@ async def info_command(message: Message):
 
     total, goal, progress, currency = calculate_progress(data)
 
+    icon, name, _ = currency_names(currency)
+
     if currency == "gems":
-        icon = "💎"
-        name = "Гемы"
         before = data.get("before_gems") or 0
     else:
-        icon = "💰"
-        name = "Монеты"
         before = (data.get("before_coins") or 0) * 1000
+
+    # Опыт считается с нуля — «до заказа» у него нет
+    before_line = "" if currency == "xp" else f"{icon} Баланс до заказа: {before:,}\n"
 
     status = get_farm_status(total, goal, currency)
 
@@ -426,7 +449,7 @@ async def info_command(message: Message):
             f"📊 Информация об игроке: {player_name}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{icon} Баланс игрока: {total:,} {name.lower()}\n"
-            f"{icon} Баланс до заказа: {before:,}\n"
+            f"{before_line}"
             f"🎯 Цель фарма: {goal:,} {name.lower()}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Прогресс: {progress}%"
@@ -506,6 +529,10 @@ def get_active_orders() -> list[dict]:
                         adjust_gems,
                         before_gems,
                         paid_gems,
+                        before_xp,
+                        paid_xp,
+                        account_xp,
+                        adjust_xp,
                         currency,
                         chat_id,
                         farm_finished
@@ -550,8 +577,7 @@ def mark_farm_finished(row_id: int, database_path: Path = DATABASE_PATH):
 # =================================================
 
 def completion_text(player: str, total, goal, progress: int, currency: str) -> str:
-    icon = "💎" if currency == "gems" else "💰"
-    name = "гемов" if currency == "gems" else "монет"
+    icon, _, name = currency_names(currency)
 
     return (
         f"✅ Фарм игрока {player} закончен!\n"
