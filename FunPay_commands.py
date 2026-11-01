@@ -12,8 +12,10 @@ from funpaybotengine.types import Message
 from funpay_shared import bot, dispatcher
 from FunPay_sales import (
     CREATE_FINISHED_ORDERS,
+    chat_link,
     connect as connect_sales,
     find_order_for_chat,
+    is_starvell_id,
     order_link,
     set_pending_player,
 )
@@ -181,7 +183,7 @@ def save_chat_id(player_name: str, chat_id: str) -> bool:
 
     try:
         updated = 0
-        chat_link = f"https://funpay.com/chat/?node={chat_id}"
+        buyer_chat_link = chat_link(chat_id)
 
         with connect_sales() as sales_connection:
             for database_path in database_paths():
@@ -198,14 +200,14 @@ def save_chat_id(player_name: str, chat_id: str) -> bool:
                     for row_id, currency, link in rows:
                         link = link or ""
 
-                        if not link.strip() or "funpay.com/chat/" in link:
+                        if not link.strip() or "funpay.com/chat/" in link or "starvell.com/chat/" in link:
                             order_id = find_order_for_chat(
                                 sales_connection,
                                 chat_id,
                                 player_name,
                                 currency or "coins"
                             )
-                            link = order_link(order_id) if order_id else chat_link
+                            link = order_link(order_id) if order_id else buyer_chat_link
 
                         connection.execute(
                             """
@@ -332,135 +334,95 @@ def get_farm_status(total: int, goal: int, currency: str) -> str:
 
 
 # =================================================
-# Команда /money
+# Команды /money и /info
 # =================================================
+#
+# Ответы собираются отдельно от FunPay: те же команды
+# обрабатывает и бот Starvell (Starvell_bot.py).
 
-@router.on_new_message(as_task=True)
-async def money_command(message: Message):
-    text = (message.text or "").strip()
+def bind_player_chat(player_name: str, chat_id, admin: bool, command: str):
+    """
+    Покупатель написал команду со своим ником — привязываем его чат
+    к строке таблицы. Администратор проверяет игрока без привязки.
+    """
+
+    if admin:
+        logging.info(
+            "Администратор проверил игрока %s через %s. ID не сохранён.",
+            player_name,
+            command
+        )
+        return
+
+    if chat_id is None:
+        return
+
+    # Ник появится в карточке продажи в Discord
+    set_pending_player(chat_id, player_name)
+
+    if save_chat_id(player_name, chat_id):
+        logging.info(
+            "Игрок %s привязан к чату %s через %s",
+            player_name,
+            chat_id,
+            command
+        )
+
+
+def money_reply(text: str, chat_id, admin: bool) -> str | None:
+    """Ответ на /money ник или None, если это не команда /money."""
 
     if not text.lower().startswith("/money"):
-        return
+        return None
 
     parts = text.split(maxsplit=1)
 
     if len(parts) < 2:
-        await message.reply(
-            text="Использование: /money ник"
-        )
-        return
+        return "Использование: /money ник"
 
     player_name = parts[1].strip()
 
     if not player_name:
-        await message.reply(
-            text="Укажите игровой ник."
-        )
-        return
+        return "Укажите игровой ник."
 
     data = get_account_data(player_name)
 
     if data is None:
-        await message.reply(
-            text=f"Ник «{player_name}» не найден в базе данных."
-        )
-        return
+        return f"Ник «{player_name}» не найден в базе данных."
 
-    # Сохраняем пользователя, который запросил баланс
-    # Администратор может проверять любого игрока,
-    # но его ID не сохраняется в базе
-    if not is_admin(message):
-        chat_id = get_chat_id_from_message(message)
-
-        if chat_id is not None:
-            # Ник появится в карточке продажи в Discord
-            set_pending_player(chat_id, player_name)
-
-            saved = save_chat_id(player_name, chat_id)
-
-            if saved:
-                logging.info(
-                    "Игрок %s привязан к чату %s через /money",
-                    player_name,
-                    chat_id
-                )
-    else:
-        logging.info(
-            "Администратор проверил игрока %s через /money. "
-            "ID не сохранён.",
-            player_name
-        )
-
+    bind_player_chat(player_name, chat_id, admin, "/money")
 
     total, goal, progress, currency = calculate_progress(data)
     icon, title, _ = currency_names(currency)
-    currency_name = f"{icon} {title}"
-    await message.reply(text=f"{currency_name} игрока {player_name}: {total:,}")
+    return f"{icon} {title} игрока {player_name}: {total:,}"
 
 
-# =================================================
-# Команда /info
-# =================================================
-
-@router.on_new_message(as_task=True)
-async def info_command(message: Message):
-    text = (message.text or "").strip()
+def info_reply(text: str, chat_id, admin: bool) -> str | None:
+    """Ответ на /info ник или None, если это не команда /info."""
 
     if not text.lower().startswith("/info"):
-        return
+        return None
 
     parts = text.split(maxsplit=1)
 
     if len(parts) < 2:
-        await message.reply(
-            text=(
-                "Использование: /info ник\n\n"
-                "Команда также привязывает ваш чат "
-                "к игровому нику."
-            )
+        return (
+            "Использование: /info ник\n\n"
+            "Команда также привязывает ваш чат "
+            "к игровому нику."
         )
-        return
 
     player_name = parts[1].strip()
 
     if not player_name:
-        await message.reply(
-            text="Укажите игровой ник."
-        )
-        return
+        return "Укажите игровой ник."
 
     data = get_account_data(player_name)
 
     if data is None:
-        await message.reply(
-            text=f"Ник «{player_name}» не найден в базе данных."
-        )
-        return
+        return f"Ник «{player_name}» не найден в базе данных."
 
-    # Сохраняем пользователя, который запросил информацию
-    # Администратор проверяет игрока без привязки своего чата
-    if not is_admin(message):
-        chat_id = get_chat_id_from_message(message)
-
-        if chat_id is not None:
-            # Ник появится в карточке продажи в Discord
-            set_pending_player(chat_id, player_name)
-
-            saved = save_chat_id(player_name, chat_id)
-
-            if saved:
-                logging.info(
-                    "Игрок %s привязан к чату %s через /info",
-                    player_name,
-                    chat_id
-                )
-    else:
-        logging.info(
-            "Администратор проверил игрока %s через /info. "
-            "ID не сохранён.",
-            player_name
-        )
-
+    bind_player_chat(player_name, chat_id, admin, "/info")
 
     total, goal, progress, currency = calculate_progress(data)
 
@@ -476,18 +438,40 @@ async def info_command(message: Message):
 
     status = get_farm_status(total, goal, currency)
 
-    await message.reply(
-        text=(
-            f"📊 Информация об игроке: {player_name}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{icon} Баланс игрока: {total:,} {name.lower()}\n"
-            f"{before_line}"
-            f"🎯 Цель фарма: {goal:,} {name.lower()}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Прогресс: {progress}%"
-            f"{status}"
-        )
+    return (
+        f"📊 Информация об игроке: {player_name}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} Баланс игрока: {total:,} {name.lower()}\n"
+        f"{before_line}"
+        f"🎯 Цель фарма: {goal:,} {name.lower()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Прогресс: {progress}%"
+        f"{status}"
     )
+
+
+@router.on_new_message(as_task=True)
+async def money_command(message: Message):
+    reply = money_reply(
+        (message.text or "").strip(),
+        get_chat_id_from_message(message),
+        is_admin(message)
+    )
+
+    if reply:
+        await message.reply(text=reply)
+
+
+@router.on_new_message(as_task=True)
+async def info_command(message: Message):
+    reply = info_reply(
+        (message.text or "").strip(),
+        get_chat_id_from_message(message),
+        is_admin(message)
+    )
+
+    if reply:
+        await message.reply(text=reply)
 
 
 # =================================================
@@ -577,12 +561,9 @@ async def get_tower_lot_link(tower_name: str) -> str:
             for groups in (profile.offers or {}).values():
                 for offers in groups.values():
                     for offer in offers:
-                        title = (offer.title or "").upper()
-                        if "ФАРМ УРОВНЯ" not in title:
-                            continue
-                        for name, _ in TOWER_ALIASES.values():
-                            if f"НА {name}" in title:
-                                lots[name] = f"https://funpay.com/lots/offer?id={offer.id}"
+                        name = tower_name_from_title(offer.title)
+                        if name:
+                            lots[name] = f"https://funpay.com/lots/offer?id={offer.id}"
 
             _tower_lots = lots
             _tower_lots_loaded_at = time.monotonic()
@@ -597,75 +578,99 @@ def calculate_exp_to_max(level_exp: list[int], level: int, exp_on_level: int) ->
     return sum(level_exp[level + 1:MAX_TOWER_LEVEL + 1]) - exp_on_level
 
 
-@router.on_new_message(as_task=True)
-async def exp_command(message: Message):
-    text = (message.text or "").strip()
+async def exp_reply(text: str, get_lot_link=None) -> str | None:
+    """
+    Ответ на /exp или None, если это не команда /exp.
+    get_lot_link(башня) -> ссылка на лот; по умолчанию — лоты FunPay.
+    """
 
     if not re.match(r"^/exp(?:\s|$)", text, flags=re.IGNORECASE):
-        return
+        return None
 
     parts = text.split()[1:]
 
     if len(parts) < 3:
-        await message.reply(text=EXP_USAGE)
-        return
+        return EXP_USAGE
 
     tower_key = "".join(parts[:-2]).lower()
     tower = TOWER_ALIASES.get(tower_key)
 
     if tower is None:
-        await message.reply(text=f"Башня «{' '.join(parts[:-2])}» не найдена.\n\n{EXP_USAGE}")
-        return
+        return f"Башня «{' '.join(parts[:-2])}» не найдена.\n\n{EXP_USAGE}"
 
     try:
         level = int(parts[-2])
         exp_on_level = int(parts[-1])
     except ValueError:
-        await message.reply(text=f"Уровень и опыт должны быть числами.\n\n{EXP_USAGE}")
-        return
+        return f"Уровень и опыт должны быть числами.\n\n{EXP_USAGE}"
 
     tower_name, tower_type = tower
     level_exp = TOWER_TYPES[tower_type]
     title = tower_name
 
     if level >= MAX_TOWER_LEVEL:
-        await message.reply(text=f"💠 {title}: уже {MAX_TOWER_LEVEL} уровень, опыт не нужен.")
-        return
+        return f"💠 {title}: уже {MAX_TOWER_LEVEL} уровень, опыт не нужен."
 
     if level < 0:
-        await message.reply(text=f"Уровень должен быть от 0 до {MAX_TOWER_LEVEL}.")
-        return
+        return f"Уровень должен быть от 0 до {MAX_TOWER_LEVEL}."
 
     next_level_exp = level_exp[level + 1]
 
     if exp_on_level < 0 or exp_on_level >= next_level_exp:
-        await message.reply(
-            text=(
-                f"На {level} уровне может быть от 0 до {next_level_exp - 1} опыта "
-                f"(на {level + 1} уровень нужно {next_level_exp})."
-            )
+        return (
+            f"На {level} уровне может быть от 0 до {next_level_exp - 1} опыта "
+            f"(на {level + 1} уровень нужно {next_level_exp})."
         )
-        return
 
     need = calculate_exp_to_max(level_exp, level, exp_on_level)
     need_text = f"{need:,}".replace(",", " ")
-    lot_link = await get_tower_lot_link(tower_name)
+    lot_link = await (get_lot_link or get_tower_lot_link)(tower_name)
     pay_line = (
         f"💳 Оплатите {need} шт. в лоте: {lot_link}"
         if lot_link
         else f"💳 Оплатите {need} шт. в лоте «ФАРМ УРОВНЯ НА {tower_name}»"
     )
 
-    await message.reply(
-        text=(
-            f"💠 Расчёт опыта: {title}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Сейчас: {level} уровень, {exp_on_level} опыта\n"
-            f"🎯 До {MAX_TOWER_LEVEL} уровня нужно: {need_text} опыта\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{pay_line}"
-        )
+    return (
+        f"💠 Расчёт опыта: {title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Сейчас: {level} уровень, {exp_on_level} опыта\n"
+        f"🎯 До {MAX_TOWER_LEVEL} уровня нужно: {need_text} опыта\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{pay_line}"
     )
+
+
+def tower_name_from_title(title: str) -> str:
+    """'...ФАРМ УРОВНЯ НА KINGPIN...' -> 'KINGPIN' (или '')."""
+    title = (title or "").upper()
+
+    if "ФАРМ УРОВНЯ" not in title:
+        return ""
+
+    for name, _ in TOWER_ALIASES.values():
+        if f"НА {name}" in title:
+            return name
+
+    return ""
+
+
+@router.on_new_message(as_task=True)
+async def exp_command(message: Message):
+    reply = await exp_reply((message.text or "").strip())
+
+    if reply:
+        await message.reply(text=reply)
+
+
+HELP_TEXT = (
+    "📖 Доступные команды:\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "/money <ник> — баланс и привязка чата\n"
+    "/info <ник> — подробная информация\n"
+    "/exp <башня> <уровень> <опыт> — сколько опыта оплатить до 20 уровня\n"
+    "/help — справка\n"
+)
 
 
 @router.on_new_message(as_task=True)
@@ -675,23 +680,19 @@ async def help_command(message: Message):
     if not text.lower().startswith("/help"):
         return
 
-    await message.reply(
-        text=(
-            "📖 Доступные команды:\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "/money <ник> — баланс и привязка чата\n"
-            "/info <ник> — подробная информация\n"
-            "/exp <башня> <уровень> <опыт> — сколько опыта оплатить до 20 уровня\n"
-            "/help — справка\n"
-        )
-    )
+    await message.reply(text=HELP_TEXT)
 
 
 # =================================================
 # Получение активных заказов
 # =================================================
 
-def get_active_orders() -> list[dict]:
+def is_platform_chat(chat_id, starvell: bool) -> bool:
+    """Чат Starvell — UUID, чат FunPay — число."""
+    return is_starvell_id(chat_id) == starvell
+
+
+def get_active_orders(starvell: bool = False) -> list[dict]:
     orders = []
 
     for database_path in database_paths():
@@ -727,6 +728,8 @@ def get_active_orders() -> list[dict]:
                 ).fetchall()
 
             for row in rows:
+                if not is_platform_chat(row["chat_id"], starvell):
+                    continue
                 order = dict(row)
                 order["database_path"] = database_path
                 orders.append(order)
@@ -771,16 +774,7 @@ def completion_text(player: str, total, goal, progress: int, currency: str) -> s
     )
 
 
-async def send_completion_message(order: dict):
-    total, goal, progress, currency = calculate_progress(order)
-
-    await bot.send_message(
-        chat_id=order["chat_id"],
-        text=completion_text(order["player"], total, goal, progress, currency)
-    )
-
-
-def get_unnotified_finished_orders() -> list[dict]:
+def get_unnotified_finished_orders(starvell: bool = False) -> list[dict]:
     """
     Аккаунты, которые нафармили: main.py сразу убирает их из таблицы,
     поэтому сообщение покупателю берём из finished_orders.
@@ -803,6 +797,8 @@ def get_unnotified_finished_orders() -> list[dict]:
                 ).fetchall()
 
             for row in rows:
+                if not is_platform_chat(row["chat_id"], starvell):
+                    continue
                 notice = dict(row)
                 notice["database_path"] = database_path
                 notices.append(notice)
@@ -817,12 +813,16 @@ def get_unnotified_finished_orders() -> list[dict]:
     return notices
 
 
-async def notify_finished_orders():
-    for notice in get_unnotified_finished_orders():
+async def send_funpay_message(chat_id, text: str):
+    await bot.send_message(chat_id=chat_id, text=text)
+
+
+async def notify_finished_orders(send=send_funpay_message, starvell: bool = False):
+    for notice in get_unnotified_finished_orders(starvell):
         try:
-            await bot.send_message(
-                chat_id=notice["chat_id"],
-                text=completion_text(
+            await send(
+                notice["chat_id"],
+                completion_text(
                     notice["player"],
                     int(round(notice["balance"])),
                     int(round(notice["goal"])),
@@ -849,6 +849,44 @@ async def notify_finished_orders():
         )
 
 
+async def check_farm(send=send_funpay_message, starvell: bool = False):
+    """
+    Пишет покупателям, чей аккаунт нафармил. send(chat_id, текст) —
+    отправка в чат площадки; starvell — какие чаты проверять.
+    """
+
+    for order in get_active_orders(starvell):
+        total, goal, progress, currency = calculate_progress(order)
+
+        if goal <= 0 or total < goal:
+            continue
+
+        try:
+            await send(
+                order["chat_id"],
+                completion_text(order["player"], total, goal, progress, currency)
+            )
+
+            mark_farm_finished(
+                order["id"],
+                order["database_path"]
+            )
+
+            logging.info(
+                "Уведомление отправлено игроку %s",
+                order["player"]
+            )
+
+        except Exception:
+            logging.exception(
+                "Не удалось отправить уведомление "
+                "игроку %s",
+                order["player"]
+            )
+
+    await notify_finished_orders(send, starvell)
+
+
 # =================================================
 # Фоновая проверка фарма
 # =================================================
@@ -856,36 +894,7 @@ async def notify_finished_orders():
 async def farm_checker():
     while True:
         try:
-            orders = get_active_orders()
-
-            for order in orders:
-                total, goal, progress, currency = calculate_progress(order)
-
-                if goal <= 0:
-                    continue
-
-                if total >= goal:
-                    try:
-                        await send_completion_message(order)
-
-                        mark_farm_finished(
-                            order["id"],
-                            order["database_path"]
-                        )
-
-                        logging.info(
-                            "Уведомление отправлено игроку %s",
-                            order["player"]
-                        )
-
-                    except Exception:
-                        logging.exception(
-                            "Не удалось отправить уведомление "
-                            "игроку %s",
-                            order["player"]
-                        )
-
-            await notify_finished_orders()
+            await check_farm()
 
         except Exception:
             logging.exception(

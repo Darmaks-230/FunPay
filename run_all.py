@@ -5,6 +5,8 @@
 - FunPay_commands.py   — команды /money, /info, /help + проверка фарма
 - FunPay_messages.py   — пересылка сообщений FunPay в Discord
 - auto_raise.py        — автоподнятие лотов
+- Starvell_bot.py      — то же для Starvell: команды, сообщения в Discord,
+                         продажи в общую таблицу, автоподнятие
 
 Все FunPay-модули работают через ОДНО подключение к FunPay
 (funpay_shared.py): один опрос событий вместо двух и одна сессия
@@ -22,6 +24,7 @@ from funpay_shared import BASE_DIR, bot, chat_storage, dispatcher
 import FunPay_commands
 import FunPay_messages
 import FunPay_sales
+import Starvell_bot
 import auto_raise
 
 
@@ -137,6 +140,7 @@ async def main() -> None:
             auto_raise.raise_loop,
             start_delay=RAISE_START_DELAY_SECONDS,
         ),
+        supervise("Starvell", Starvell_bot.run),
     )
 
 

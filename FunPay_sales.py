@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS pending_sales (
     done_by TEXT NOT NULL DEFAULT '',
     row_name TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT '',
-    form_data TEXT NOT NULL DEFAULT ''
+    form_data TEXT NOT NULL DEFAULT '',
+    short_id TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -70,15 +71,16 @@ CLOSE_REASONS = {
 def ensure_pending_sales_columns(connection) -> None:
     """
     form_data — данные формы заказа, поставленного в очередь
-    (у того же аккаунта уже идёт фарм). В базе от прошлой версии
-    этого столбца нет.
+    (у того же аккаунта уже идёт фарм); short_id — короткий номер
+    заказа Starvell для показа. В базе от прошлых версий этих столбцов нет.
     """
     columns = {row[1] for row in connection.execute("PRAGMA table_info(pending_sales)")}
 
-    if "form_data" not in columns:
-        connection.execute(
-            "ALTER TABLE pending_sales ADD COLUMN form_data TEXT NOT NULL DEFAULT ''"
-        )
+    for column in ("form_data", "short_id"):
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE pending_sales ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            )
 
 
 def ensure_closed_orders_columns(connection) -> None:
@@ -111,8 +113,23 @@ CREATE TABLE IF NOT EXISTS finished_orders (
 """
 
 
+# Заказы и чаты Starvell — UUID (с дефисами), FunPay — буквы и цифры
+STARVELL_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def is_starvell_id(value) -> bool:
+    return bool(re.fullmatch(STARVELL_ID, str(value or "").strip().lower()))
+
+
 def order_id_from_link(link: str) -> str:
-    """'https://funpay.com/orders/RFZLSDVU/' -> 'RFZLSDVU'"""
+    """
+    'https://funpay.com/orders/RFZLSDVU/' -> 'RFZLSDVU'
+    'https://starvell.com/order/01a1970a-...' -> '01a1970a-...'
+    """
+    match = re.search(rf"starvell\.com/order/({STARVELL_ID})", (link or "").lower())
+    if match:
+        return match.group(1)
+
     match = re.search(r"/orders/([A-Za-z0-9]+)", link or "")
     return match.group(1) if match else ""
 
@@ -168,7 +185,22 @@ def find_order_for_chat(connection, chat_id, player: str, currency: str = "") ->
 
 
 def order_link(order_id: str) -> str:
+    if is_starvell_id(order_id):
+        return f"https://starvell.com/order/{order_id}"
     return f"https://funpay.com/orders/{order_id}/"
+
+
+def chat_link(chat_id) -> str:
+    if is_starvell_id(chat_id):
+        return f"https://starvell.com/chat/{chat_id}"
+    return f"https://funpay.com/chat/?node={chat_id}"
+
+
+def order_link_patterns(order_id: str) -> tuple[str, str]:
+    """Шаблоны LIKE для поиска строк таблицы со ссылкой на заказ."""
+    if is_starvell_id(order_id):
+        return f"%/order/{order_id}%", f"%/order/{order_id.upper()}%"
+    return f"%/orders/{order_id}/%", f"%/orders/{order_id}"
 
 
 def connect() -> sqlite3.Connection:
@@ -207,6 +239,7 @@ def save_sale(
     chat_id: str,
     title: str,
     price: str,
+    short_id: str = "",
 ) -> None:
     currency, amount = parse_sale_title(title)
 
@@ -215,9 +248,9 @@ def save_sale(
             """
             INSERT OR IGNORE INTO pending_sales(
                 order_id, buyer, chat_id, title, currency,
-                amount, price, created_at
+                amount, price, created_at, short_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -228,8 +261,22 @@ def save_sale(
                 amount,
                 price,
                 datetime.now(timezone.utc).isoformat(),
+                short_id,
             ),
         )
+
+
+def close_order(order_id: str, reason: str) -> bool:
+    """Заказ закрыт — main.py уберёт его из таблицы. True, если запись новая."""
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO closed_orders(order_id, created_at, reason)
+            VALUES (?, ?, ?)
+            """,
+            (order_id, datetime.now(timezone.utc).isoformat(), reason),
+        )
+        return cursor.rowcount > 0
 
 
 def set_pending_player(chat_id: str, player: str) -> None:
@@ -325,14 +372,7 @@ async def handle_order_closed(message: Message):
     order_id, reason = result
 
     try:
-        with connect() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO closed_orders(order_id, created_at, reason)
-                VALUES (?, ?, ?)
-                """,
-                (order_id, datetime.now(timezone.utc).isoformat(), reason),
-            )
+        close_order(order_id, reason)
     except sqlite3.Error:
         logging.exception("Не удалось сохранить закрытие заказа #%s", order_id)
         return

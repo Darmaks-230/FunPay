@@ -6,6 +6,9 @@ orders.sqlite3
 *.sqlite3
 funpay_channels.json
 funpay_channels.tmp
+starvell_channels.json
+starvell_state.json
+*.tmp
 
 # Логи
 logs/

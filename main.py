@@ -20,10 +20,14 @@ from FunPay_sales import (
     CREATE_CLOSED_ORDERS,
     CREATE_FINISHED_ORDERS,
     CREATE_PENDING_SALES,
+    STARVELL_ID,
     ensure_closed_orders_columns,
     ensure_pending_sales_columns,
     find_order_for_chat,
+    is_starvell_id,
     order_id_from_link,
+    order_link,
+    order_link_patterns,
 )
 
 
@@ -696,7 +700,7 @@ def format_row(row) -> str:
     time_str = f"| {format_timestamp(updated_at)}" if player != "-" else ""
 
     marketplace_name = marketplace(link)
-    marketplace_text = f"| [{marketplace_name}]({link})" if link else ""
+    marketplace_text = f"| [{marketplace_name}](<{link}>)" if link else ""
 
     ping_sent = row["ping_sent"] or 0
     ping_status = "🔔" if ping_sent else ""
@@ -716,7 +720,7 @@ def format_row(row) -> str:
         ]
 
         if link:
-            parts.append(f"[{marketplace_name}]({link})")
+            parts.append(f"[{marketplace_name}](<{link}>)")
 
         if player != "-" and updated_at:
             parts.append(format_timestamp(updated_at))
@@ -1035,7 +1039,7 @@ async def finish_farm(row, total_balance, total, currency_name: str):
     ]
 
     if order_id:
-        lines.append(f"Заказ: [#{order_id}](<{sale_link(order_id)}>)")
+        lines.append(f"Заказ: [#{sale_label(order_id)}](<{sale_link(order_id)}>)")
     elif link:
         lines.append(f"Заказ: [чат с покупателем](<{link}>)")
 
@@ -1059,7 +1063,7 @@ async def finish_farm(row, total_balance, total, currency_name: str):
             view.add_item(SaleButton("start", sale["order_id"]))
             lines.append(
                 f"⏭️ Следующий заказ: {CURRENCIES[queued_form(sale)['currency']]['title']} "
-                f"[#{sale['order_id']}](<{sale_link(sale['order_id'])}>) — нажмите «▶️ Начать»."
+                f"[#{sale_label(sale['order_id'])}](<{sale_link(sale['order_id'])}>) — нажмите «▶️ Начать»."
             )
 
     if order_id:
@@ -1139,7 +1143,7 @@ async def process_closed_orders():
                         except Exception as error:
                             print(f"[closed_orders] Ошибка обновления таблицы: {error}")
 
-            update_pending_sale(order_id, status=reason, done_by="FunPay")
+            update_pending_sale(order_id, status=reason, done_by=sale_platform(sale))
             await archive_sale_card(get_pending_sale(order_id))
 
         for guild_id in known_guild_ids():
@@ -1150,14 +1154,14 @@ async def process_closed_orders():
                     FROM rows
                     WHERE link LIKE ? OR link LIKE ?
                     """,
-                    (f"%/orders/{order_id}/%", f"%/orders/{order_id}")
+                    order_link_patterns(order_id)
                 ).fetchall()
 
                 for row in rows:
                     await delete_row_notifications(row["id"])
                     clear_row_by_id(row["id"], reason_text)
                     print(
-                        f"[closed_orders] {reason_text} #{order_id}: "
+                        f"[closed_orders] {reason_text} #{sale_label(order_id)}: "
                         f"строка {row['block_number']}.{row['row_number']} очищена"
                     )
 
@@ -1172,7 +1176,7 @@ async def process_closed_orders():
                         "DELETE FROM finished_orders WHERE id = ?",
                         (notice["id"],)
                     )
-                    print(f"[closed_orders] {reason_text} #{order_id}: сообщение удалено")
+                    print(f"[closed_orders] {reason_text} #{sale_label(order_id)}: сообщение удалено")
 
                 db.commit()
 
@@ -1526,7 +1530,8 @@ async def _update_table_messages(force: bool):
     ]
 
     async def send_new(index: int, text: str) -> int:
-        message = await channel.send(content=text)
+        # Без превью ссылок (Starvell показывает карточку «Авторизация»)
+        message = await channel.send(content=text, suppress_embeds=True)
         db.execute(
             """
             INSERT INTO table_messages(message_id, channel_id, position)
@@ -1707,12 +1712,17 @@ def first_free_row():
 
 def chat_id_from_link(link: str) -> str:
     """
-    Чат покупателя на FunPay по ссылке в строке — чтобы по окончании
-    фарма ему ушло сообщение, даже если он не писал /info ник:
+    Чат покупателя на FunPay или Starvell по ссылке в строке — чтобы
+    по окончании фарма ему ушло сообщение, даже если он не писал /info ник:
     - ссылка на чат: https://funpay.com/chat/?node=293899498
+      или https://starvell.com/chat/<uuid>
     - ссылка на заказ: чат берётся из сохранённой продажи
     """
     match = re.search(r"node=(\d+)", link or "")
+    if match:
+        return match.group(1)
+
+    match = re.search(rf"starvell\.com/chat/({STARVELL_ID})", (link or "").lower())
     if match:
         return match.group(1)
 
@@ -2596,7 +2606,7 @@ async def menu_set_channel(interaction: discord.Interaction):
     await send_result(interaction, "Теперь таблица этого сервера в этом канале.")
 
 
-@menu_group.command(name="set-history-channel", description="Сюда будут попадать обработанные продажи FunPay")
+@menu_group.command(name="set-history-channel", description="Сюда будут попадать обработанные продажи FunPay и Starvell")
 async def menu_set_history_channel(interaction: discord.Interaction):
     if not is_manager(interaction):
         return await deny(interaction)
@@ -2608,7 +2618,7 @@ async def menu_set_history_channel(interaction: discord.Interaction):
     await send_result(interaction, "Обработанные продажи будут записываться в этот канал.")
 
 
-@menu_group.command(name="set-sales-channel", description="Сюда будут приходить карточки новых продаж FunPay")
+@menu_group.command(name="set-sales-channel", description="Сюда будут приходить карточки новых продаж FunPay и Starvell")
 async def menu_set_sales_channel(interaction: discord.Interaction):
     if not is_manager(interaction):
         return await deny(interaction)
@@ -2617,7 +2627,7 @@ async def menu_set_sales_channel(interaction: discord.Interaction):
     with use_guild(None):
         set_setting("sales_channel_id", str(interaction.channel_id))
 
-    await send_result(interaction, "Карточки новых продаж FunPay будут приходить в этот канал.")
+    await send_result(interaction, "Карточки новых продаж FunPay и Starvell будут приходить в этот канал.")
 
 
 @menu_group.command(name="set-stale-channel", description="Сделать этот канал каналом уведомлений о просрочке")
@@ -2683,7 +2693,26 @@ SALES_CHECK_SECONDS = 10
 
 
 def sale_link(order_id: str) -> str:
-    return f"https://funpay.com/orders/{order_id}/"
+    return order_link(order_id)
+
+
+def sale_label(order_id: str) -> str:
+    """
+    Номер заказа для показа. У Starvell номер заказа — длинный UUID,
+    поэтому показываем короткий номер с сайта (VDCJ49Q1).
+    """
+    if not is_starvell_id(order_id):
+        return order_id
+
+    sale = get_pending_sale(order_id)
+    if sale is not None and sale["short_id"]:
+        return sale["short_id"]
+
+    return order_id[:8].upper()
+
+
+def sale_platform(sale) -> str:
+    return "Starvell" if is_starvell_id(sale["order_id"]) else "FunPay"
 
 
 def get_pending_sale(order_id: str):
@@ -2764,7 +2793,7 @@ def build_sale_embed(sale) -> discord.Embed:
     status = sale["status"]
 
     embed = discord.Embed(
-        title=f"🛒 Продажа #{sale['order_id']}",
+        title=f"🛒 Продажа {sale_platform(sale)} #{sale_label(sale['order_id'])}",
         url=sale_link(sale["order_id"]),
         color={"new": 0x2ECC71, "queued": 0xE67E22}.get(status, 0x95A5A6)
     )
@@ -2779,7 +2808,7 @@ def build_sale_embed(sale) -> discord.Embed:
     embed.add_field(name="Сумма", value=sale["price"] or "—")
     embed.add_field(
         name="Ник в игре",
-        value=sale["player"] or "пока неизвестен — покупатель может написать /info ник в чат FunPay",
+        value=sale["player"] or f"пока неизвестен — покупатель может написать /info ник в чат {sale_platform(sale)}",
         inline=False
     )
 
@@ -2911,7 +2940,7 @@ async def archive_sale_card(sale):
 
 class SaleButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"sale:(?P<action>add|skip|start):(?P<order_id>[A-Za-z0-9]+)"
+    template=r"sale:(?P<action>add|skip|start):(?P<order_id>[A-Za-z0-9-]+)"
 ):
     """Кнопки карточки. Работают и после перезапуска бота."""
 
@@ -2925,7 +2954,7 @@ class SaleButton(
             )
         elif action == "start":
             button = discord.ui.Button(
-                label=f"Начать #{order_id}",
+                label=f"Начать #{sale_label(order_id)}",
                 emoji="▶️",
                 style=discord.ButtonStyle.primary,
                 custom_id=f"sale:start:{order_id}"
@@ -2997,7 +3026,8 @@ class SaleModal(discord.ui.Modal):
         form = queued_form(sale) if self.from_queue else {}
         currency = form.get("currency") or sale["currency"]
 
-        title = f"Начать заказ #{sale['order_id']}" if self.from_queue else f"Заказ #{sale['order_id']} в таблицу"
+        label = sale_label(sale["order_id"])
+        title = f"Начать заказ #{label}" if self.from_queue else f"Заказ #{label} в таблицу"
         super().__init__(title=title, timeout=600)
 
         self.order_id = sale["order_id"]
@@ -3172,7 +3202,7 @@ class SaleModal(discord.ui.Modal):
             await update_finish_messages(sale["player"] or player)
 
         await update_table_messages()
-        await send_result(interaction, f"Заказ #{self.order_id} записан в строку {row_name}.")
+        await send_result(interaction, f"Заказ #{sale_label(self.order_id)} записан в строку {row_name}.")
 
     async def queue_order(self, interaction, sale, active, player, before, paid, currency, xp_per_game):
         """
@@ -3207,7 +3237,7 @@ class SaleModal(discord.ui.Modal):
 
         await send_result(
             interaction,
-            f"У {player} уже идёт фарм в строке {active_name}. Заказ #{self.order_id} "
+            f"У {player} уже идёт фарм в строке {active_name}. Заказ #{sale_label(self.order_id)} "
             f"поставлен в очередь: нажмите «▶️ Начать», когда текущий фарм закончится."
         )
 
