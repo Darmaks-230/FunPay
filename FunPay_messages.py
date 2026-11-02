@@ -57,7 +57,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 IMAGE_TEXT = "📷 Картинка"
 
-CHANNEL_DELETE_AFTER_DAYS = 3
+CHANNEL_DELETE_AFTER_DAYS = 1
 CHANNEL_CLEANUP_INTERVAL = 60 * 60
 
 CHANNELS_FILE = BASE_DIR / "funpay_channels.json"
@@ -248,7 +248,11 @@ def parse_iso_datetime(value):
         return None
 
 
-def clean_channel_name(username: str) -> str:
+def clean_channel_name(username: str, platform: str = "funpay") -> str:
+    """
+    Название канала покупателя: приставка площадки и ник,
+    например funpay-vasya или starvell-vasya (общая категория).
+    """
     username = username.lower().strip()
 
     username = re.sub(
@@ -268,7 +272,7 @@ def clean_channel_name(username: str) -> str:
     if not username:
         username = "unknown"
 
-    return username[:100]
+    return f"{platform}-{username}"[:100]
 
 
 def get_username(message: Message) -> str:
@@ -796,7 +800,7 @@ def build_embed(
         )
 
     embed.set_footer(
-        text=style["title"]
+        text=f"{style['title']} · FunPay"
     )
 
     return embed
@@ -886,6 +890,65 @@ async def rename_channel_if_needed(
         )
 
 
+# Discord: не больше 50 каналов в одной категории
+CATEGORY_CHANNEL_LIMIT = 50
+
+# Откуда ещё брать каналы покупателей (бот Starvell добавляет свои)
+managed_channel_sources = [
+    lambda: [data.get("channel_id") for data in user_channels.values()]
+]
+
+
+async def free_category_slot():
+    """
+    Категория заполнена — удаляем канал покупателя, где дольше всего
+    не было сообщений (вызывается под channel_lock). Каналы, которые
+    создал не бот (не funpay-/starvell- и не из сохранённых), не трогаем.
+    """
+
+    if len(discord_category.channels) < CATEGORY_CHANNEL_LIMIT:
+        return
+
+    managed_ids = {
+        channel_id
+        for source in managed_channel_sources
+        for channel_id in source()
+    }
+
+    candidates = [
+        channel
+        for channel in discord_category.text_channels
+        if channel.id in managed_ids
+        or channel.name.startswith(("funpay-", "starvell-"))
+    ]
+
+    if not candidates:
+        logging.error(
+            "Категория %s заполнена (%s каналов), удалить нечего",
+            discord_category.name,
+            CATEGORY_CHANNEL_LIMIT
+        )
+        return
+
+    # ID последнего сообщения растёт со временем: меньше — дольше молчит
+    oldest = min(
+        candidates,
+        key=lambda channel: channel.last_message_id or channel.id
+    )
+
+    try:
+        await oldest.delete(
+            reason="Категория заполнена: место для нового чата"
+        )
+        print(f"Категория заполнена, удалён старый канал #{oldest.name}")
+    except discord.HTTPException as error:
+        logging.error(
+            "Не удалось удалить канал #%s: %s",
+            oldest.name,
+            error
+        )
+
+
 async def get_or_create_user_channel(
     chat_id: str,
     buyer_username
@@ -952,7 +1015,7 @@ async def get_or_create_user_channel(
             )
         else:
             # Ник пока неизвестен — переименуем, когда узнаем
-            channel_name = f"chat-{chat_id}"
+            channel_name = clean_channel_name(f"chat-{chat_id}")
 
         channel = discord.utils.get(
             discord_category.text_channels,
@@ -960,6 +1023,8 @@ async def get_or_create_user_channel(
         )
 
         if channel is None:
+            await free_category_slot()
+
             channel = await discord_guild.create_text_channel(
                 name=channel_name,
                 category=discord_category,
@@ -1143,7 +1208,7 @@ async def cleanup_inactive_channels():
                             await channel.delete(
                                 reason=(
                                     "Канал FunPay неактивен "
-                                    f"{CHANNEL_DELETE_AFTER_DAYS} дня"
+                                    f"{CHANNEL_DELETE_AFTER_DAYS} дн."
                                 )
                             )
 

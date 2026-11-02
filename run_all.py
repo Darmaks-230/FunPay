@@ -56,6 +56,8 @@ def setup_logging() -> None:
 
     # discord.py очень разговорчив на INFO
     logging.getLogger("discord").setLevel(logging.WARNING)
+    # Каждый запрос опроса FunPay («Making POST request to .../runner/»)
+    logging.getLogger("funpaybotengine.session").setLevel(logging.WARNING)
 
 
 async def supervise(name, start_coroutine, start_delay: float = 0) -> None:

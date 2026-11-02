@@ -2,7 +2,7 @@
 Бот Starvell — то же, что боты FunPay, но для starvell.com:
 
 - команды покупателей в чате: /money, /info, /exp, /help
-- пересылка чатов Starvell в Discord (своя категория каналов)
+- пересылка чатов Starvell в Discord (каналы starvell-ник рядом с funpay-ник)
   и события заказов в канал событий
 - новые продажи -> карточка «➕ В таблицу» в общей Discord-таблице,
   подтверждение и возврат убирают аккаунт из таблицы
@@ -54,11 +54,8 @@ def env_int(name: str, default: int = 0) -> int:
         return default
 
 
-# Своя категория каналов для чатов Starvell. Если не задана —
-# каналы создаются в категории FunPay с приставкой «sv-».
-STARVELL_CATEGORY_ID = env_int("STARVELL_DISCORD_CATEGORY_ID")
-# Канал событий; если не задан — общий канал событий FunPay
-STARVELL_EVENTS_CHANNEL_ID = env_int("STARVELL_DISCORD_EVENTS_CHANNEL_ID")
+# Чаты Starvell идут в ту же категорию и тот же канал событий, что и FunPay;
+# каналы покупателей отличаются приставкой: starvell-ник и funpay-ник.
 STARVELL_WEBHOOK_NAME = os.getenv("STARVELL_WEBHOOK_NAME", "Starvell").strip() or "Starvell"
 
 STARVELL_RAISE = os.getenv("STARVELL_RAISE", "true").lower() in {"1", "true", "yes", "on"}
@@ -205,40 +202,22 @@ def discord_guild():
     return funpay_messages.discord_guild
 
 
-def starvell_category():
-    guild = discord_guild()
-    if STARVELL_CATEGORY_ID:
-        category = guild.get_channel(STARVELL_CATEGORY_ID)
-        if isinstance(category, discord.CategoryChannel):
-            return category
-        log.error("STARVELL_DISCORD_CATEGORY_ID не является категорией Discord")
-    return funpay_messages.discord_category
-
-
-def events_channel():
-    if STARVELL_EVENTS_CHANNEL_ID:
-        channel = discord_guild().get_channel(STARVELL_EVENTS_CHANNEL_ID)
-        if isinstance(channel, discord.TextChannel):
-            return channel
-        log.error("STARVELL_DISCORD_EVENTS_CHANNEL_ID не является текстовым каналом")
-    return funpay_messages.discord_events_channel
-
-
 def channel_name_for(username: str, chat_id: str) -> str:
-    name = funpay_messages.clean_channel_name(username) if username else f"chat-{chat_id[:8]}"
-    # В общей с FunPay категории каналы Starvell отличаются приставкой
-    if not STARVELL_CATEGORY_ID:
-        name = f"sv-{name}"
-    return name[:100]
+    return funpay_messages.clean_channel_name(username or f"chat-{chat_id[:8]}", "starvell")
 
 
-channel_lock = asyncio.Lock()
+# Общий с FunPay замок: каналы обеих площадок в одной категории
+channel_lock = funpay_messages.channel_lock
+
+funpay_messages.managed_channel_sources.append(
+    lambda: [data.get("channel_id") for data in user_channels.values()]
+)
 
 
 async def get_or_create_user_channel(chat_id: str, username: str):
     await funpay_messages.discord_ready.wait()
 
-    category = starvell_category()
+    category = funpay_messages.discord_category
     session = funpay_messages.discord_client.http._HTTPClient__session
 
     async with channel_lock:
@@ -248,10 +227,12 @@ async def get_or_create_user_channel(chat_id: str, username: str):
             channel = discord_guild().get_channel(saved.get("channel_id"))
             if channel is not None and saved.get("webhook_url"):
                 saved["last_activity"] = datetime.now(timezone.utc).isoformat()
-                if username and saved.get("username") != username:
+                if username:
                     saved["username"] = username
+                name = channel_name_for(saved.get("username") or "", chat_id)
+                if channel.name != name:
                     try:
-                        await channel.edit(name=channel_name_for(username, chat_id))
+                        await channel.edit(name=name)
                     except discord.HTTPException as error:
                         log.error("Ошибка переименования канала #%s: %s", channel.name, error)
                 save_json(CHANNELS_FILE, user_channels)
@@ -262,6 +243,8 @@ async def get_or_create_user_channel(chat_id: str, username: str):
         channel = discord.utils.get(category.text_channels, name=name)
 
         if channel is None:
+            await funpay_messages.free_category_slot()
+
             channel = await discord_guild().create_text_channel(
                 name=name,
                 category=category,
@@ -285,9 +268,7 @@ async def get_or_create_user_channel(chat_id: str, username: str):
             "last_activity": datetime.now(timezone.utc).isoformat(),
         }
         save_json(CHANNELS_FILE, user_channels)
-
-        if category.id == funpay_messages.DISCORD_CATEGORY_ID:
-            await funpay_messages.move_channel_to_top(channel)
+        await funpay_messages.move_channel_to_top(channel)
 
         return channel, webhook
 
@@ -356,7 +337,7 @@ async def forward_to_discord(chat_id: str, username: str, author: str, text: str
         if event_type not in ("message", "payment"):
             embed = build_embed(author, text, chat_id, event_type, order_id)
             funpay_messages.add_review_fields(embed, review)
-            await events_channel().send(embed=embed)
+            await funpay_messages.discord_events_channel.send(embed=embed)
 
     except Exception:
         log.exception("Ошибка отправки сообщения Starvell в Discord")
@@ -386,7 +367,7 @@ async def delete_inactive_channels():
             channel = discord_guild().get_channel(data.get("channel_id"))
             try:
                 if channel is not None:
-                    await channel.delete(reason=f"Канал Starvell неактивен {CHANNEL_DELETE_AFTER_DAYS} дня")
+                    await channel.delete(reason=f"Канал Starvell неактивен {CHANNEL_DELETE_AFTER_DAYS} дн.")
                     log.info("Удалён неактивный канал #%s", channel.name)
             except discord.NotFound:
                 pass
