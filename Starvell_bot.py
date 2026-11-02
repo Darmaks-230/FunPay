@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -407,6 +408,15 @@ async def fetch_review(order_id: str):
     return SimpleNamespace(rating=int(review.get("rating") or 0), text=review.get("content") or "")
 
 
+# Признаки вредоносного кода в сообщении (XSS: <img onerror=eval(atob(...))>).
+# Такой код с вашего аккаунта рассылает вирус, запущенный в браузере на starvell.com.
+SUSPICIOUS_CODE = re.compile(r"onerror\s*=|<\s*script|javascript:|eval\s*\(|atob\s*\(", re.IGNORECASE)
+
+SUSPICIOUS_WARNING = (
+    "⚠️ ВРЕДОНОСНЫЙ КОД — не открывайте этот чат на starvell.com в браузере!\n"
+)
+
+
 def message_image_url(message: dict) -> str:
     for image in message.get("images") or []:
         if isinstance(image, dict) and image.get("id"):
@@ -465,6 +475,11 @@ async def handle_message(chat: dict, message: dict):
         return
 
     author = starvell.username if is_mine else (username or "Покупатель")
+
+    if SUSPICIOUS_CODE.search(text):
+        text = SUSPICIOUS_WARNING + text
+        log.warning("Подозрительное сообщение в чате Starvell %s (отправил %s)", chat_id, author)
+
     log.info("[Starvell] %s: %s (chat %s)", author, text or funpay_messages.IMAGE_TEXT, chat_id)
     await forward_to_discord(
         chat_id,
@@ -530,15 +545,47 @@ async def _poll_chats(first_run: bool):
         save_json(STATE_FILE, state)
 
 
+def is_site_down(error: Exception) -> bool:
+    """Starvell недоступен (502, техработы, нет соединения) — не ошибка бота."""
+    if isinstance(error, StarvellError):
+        return error.status >= 500
+    return isinstance(error, (aiohttp.ClientConnectionError, asyncio.TimeoutError))
+
+
+# Пока сайт лежит, пишем в лог один раз, а не каждые 5 секунд
+site_down_since: float | None = None
+
+
+def report_poll_error(what: str, error: Exception):
+    global site_down_since
+
+    if is_site_down(error):
+        if site_down_since is None:
+            site_down_since = time.monotonic()
+            log.warning("Starvell недоступен (%s), жду восстановления: %s", what, error)
+        return
+
+    if isinstance(error, StarvellError):
+        log.error("Ошибка опроса %s Starvell: %s", what, error)
+    else:
+        log.exception("Ошибка опроса %s Starvell", what)
+
+
+def report_poll_ok():
+    global site_down_since
+
+    if site_down_since is not None:
+        log.info("Starvell снова доступен (не работал %s мин.)", int((time.monotonic() - site_down_since) // 60))
+        site_down_since = None
+
+
 async def chats_loop():
     while True:
         try:
             await poll_chats()
-        except StarvellError as error:
-            log.error("Ошибка опроса чатов Starvell: %s", error)
-            await asyncio.sleep(30)
-        except Exception:
-            log.exception("Ошибка опроса чатов Starvell")
+            report_poll_ok()
+        except Exception as error:
+            report_poll_error("чатов", error)
             await asyncio.sleep(30)
         await asyncio.sleep(CHATS_POLL_SECONDS)
 
@@ -628,11 +675,9 @@ async def orders_loop():
     while True:
         try:
             await poll_orders()
-        except StarvellError as error:
-            log.error("Ошибка опроса заказов Starvell: %s", error)
-            await asyncio.sleep(30)
-        except Exception:
-            log.exception("Ошибка опроса заказов Starvell")
+            report_poll_ok()
+        except Exception as error:
+            report_poll_error("заказов", error)
             await asyncio.sleep(30)
         await asyncio.sleep(ORDERS_POLL_SECONDS)
 
@@ -741,7 +786,18 @@ async def run():
         # Не даём супервизору перезапускать без конца
         await asyncio.Event().wait()
 
-    user = await starvell.login()
+    # Техработы на Starvell: ждём молча, без падения и трассировки в логе
+    while True:
+        try:
+            user = await starvell.login()
+            break
+        except Exception as error:
+            if not is_site_down(error):
+                raise
+            report_poll_error("входа", error)
+            await asyncio.sleep(60)
+
+    report_poll_ok()
     log.info("Starvell подключён: %s (id %s)", user.get("username"), user.get("id"))
 
     try:

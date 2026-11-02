@@ -369,6 +369,18 @@ def bind_player_chat(player_name: str, chat_id, admin: bool, command: str):
         )
 
 
+# Игровой ник: буквы, цифры и «_». Всё остальное в ответ не повторяем:
+# иначе вместо ника присылают вредоносный код (<img onerror=...>),
+# и бот сам отправляет его покупателям от имени продавца.
+NICK_PATTERN = re.compile(r"[A-Za-z0-9_]{2,32}")
+
+INVALID_NICK_TEXT = "Ник может содержать только латинские буквы, цифры и «_»."
+
+
+def is_valid_nick(player_name: str) -> bool:
+    return bool(NICK_PATTERN.fullmatch(player_name))
+
+
 def money_reply(text: str, chat_id, admin: bool) -> str | None:
     """Ответ на /money ник или None, если это не команда /money."""
 
@@ -384,6 +396,9 @@ def money_reply(text: str, chat_id, admin: bool) -> str | None:
 
     if not player_name:
         return "Укажите игровой ник."
+
+    if not is_valid_nick(player_name):
+        return INVALID_NICK_TEXT
 
     data = get_account_data(player_name)
 
@@ -416,6 +431,9 @@ def info_reply(text: str, chat_id, admin: bool) -> str | None:
 
     if not player_name:
         return "Укажите игровой ник."
+
+    if not is_valid_nick(player_name):
+        return INVALID_NICK_TEXT
 
     data = get_account_data(player_name)
 
@@ -596,7 +614,8 @@ async def exp_reply(text: str, get_lot_link=None) -> str | None:
     tower = TOWER_ALIASES.get(tower_key)
 
     if tower is None:
-        return f"Башня «{' '.join(parts[:-2])}» не найдена.\n\n{EXP_USAGE}"
+        # Название из сообщения не повторяем (см. NICK_PATTERN)
+        return f"Башня не найдена.\n\n{EXP_USAGE}"
 
     try:
         level = int(parts[-2])
