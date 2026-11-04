@@ -2769,6 +2769,47 @@ async def menu_set_role(interaction: discord.Interaction, role: discord.Role):
 bot.tree.add_command(menu_group)
 
 
+# -----------------------------
+# /help — список команд
+# -----------------------------
+#
+# Список собирается из самих команд, поэтому новые команды попадают
+# в /help без правки этого кода.
+
+HELP_SECTIONS = {
+    "order": "📦 Заказы",
+    "menu": "🛠️ Таблица и настройки (администраторы)",
+}
+HELP_OTHER = "📝 Другое"
+HELP_MANAGER_ONLY = {"lot-description"}
+
+
+@bot.tree.command(name="help", description="Список команд бота")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="Команды бота", color=discord.Color.blurple())
+    other = []
+
+    for command in bot.tree.get_commands():
+        if isinstance(command, app_commands.Group):
+            lines = [
+                f"`/{command.name} {sub.name}` — {sub.description}"
+                for sub in command.commands
+            ]
+            embed.add_field(
+                name=HELP_SECTIONS.get(command.name, f"/{command.name}"),
+                value="\n".join(lines)[:1024] or "—",
+                inline=False
+            )
+        elif command.name != "help":
+            note = " (администраторы)" if command.name in HELP_MANAGER_ONLY else ""
+            other.append(f"`/{command.name}` — {command.description}{note}")
+
+    if other:
+        embed.add_field(name=HELP_OTHER, value="\n".join(other)[:1024], inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def set_interaction_guild(interaction: discord.Interaction) -> bool:
     """Каждая команда работает с таблицей своего сервера."""
     if interaction.guild_id is None:
