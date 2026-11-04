@@ -9,6 +9,7 @@
 | `FunPay_messages.py` | Пересылает сообщения FunPay в отдельные каналы Discord |
 | `auto_raise.py` | Автоматически поднимает свои лоты на FunPay |
 | `Starvell_bot.py` | То же для Starvell: команды в чате, сообщения в Discord, продажи в общую таблицу, автоподнятие (клиент — `starvell_api.py`) |
+| `lot_descriptions.py` | Меняет полное описание лотов монет, гемов или опыта на FunPay и Starvell по команде `/lot-description` в Discord; в описании опыта `{tower}` заменяется названием башни из названия лота |
 | `run_all.py` | Запускает всех ботов сразу; FunPay-боты работают через одно подключение (`funpay_shared.py`) |
 
 ## Установка

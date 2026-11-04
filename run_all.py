@@ -26,6 +26,7 @@ import FunPay_messages
 import FunPay_sales
 import Starvell_bot
 import auto_raise
+import lot_descriptions
 
 
 RESTART_DELAY_SECONDS = 15
@@ -143,6 +144,7 @@ async def main() -> None:
             start_delay=RAISE_START_DELAY_SECONDS,
         ),
         supervise("Starvell", Starvell_bot.run),
+        supervise("Описания лотов", lot_descriptions.jobs_loop),
     )
 
 

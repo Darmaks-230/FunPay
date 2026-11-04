@@ -342,6 +342,65 @@ class StarvellClient:
                     return container[key]
         return []
 
+    async def offer(self, public_id: str) -> dict:
+        data = await self.api("GET", f"/api/offers/{public_id}", referer=offer_link(public_id))
+        return data.get("data", data) if isinstance(data, dict) else {}
+
+    async def set_offer_description(self, public_id: str, description: str) -> dict:
+        """
+        Меняет полное описание лота. Сайт сохраняет лот целиком, поэтому
+        берём текущий лот и отправляем его с новым описанием — как форма
+        редактирования на starvell.com.
+        """
+        # Данные страницы редактирования: в них полный список тегов
+        props = await self.page(f"offers/edit/{public_id}", params={"offer_id": public_id})
+        offer = props.get("offer") or {}
+        if not offer:
+            raise StarvellError(f"Лот {public_id} не найден")
+
+        descriptions = (offer.get("descriptions") or {}).get("rus") or {}
+        attributes = offer.get("attributes") or []
+
+        payload = {
+            **offer,
+            "descriptions": {
+                "rus": {
+                    "briefDescription": descriptions.get("briefDescription"),
+                    "description": description.strip(),
+                }
+            },
+            "tags": offer.get("tags") or [],
+            "goods": [],
+            "goodsInstruction": offer.get("goodsInstruction"),
+            "basicAttributes": [item for item in attributes if item.get("optionId") is not None],
+            "numericAttributes": [
+                {**item, "numericValue": float(item["numericValue"])}
+                for item in attributes
+                if item.get("numericValue") is not None
+            ],
+            # Цену Starvell принимает только с 2 знаками после запятой
+            "price": str(offer.get("price") or "0"),
+            "availability": int(offer.get("availability") or 0),
+        }
+        for key in ("attributes", "images"):
+            payload.pop(key, None)
+
+        try:
+            return await self.api(
+                "POST",
+                f"/api/offers/{public_id}/update",
+                payload,
+                referer=f"{BASE_URL}/offers/edit/{public_id}",
+            )
+        except StarvellError as error:
+            if error.status == 400 and "цен" in str(error).lower():
+                raise StarvellError(
+                    f"цена лота {payload['price']} ₽ — больше 2 знаков после запятой, "
+                    "Starvell не сохранит лот, пока цену не округлить",
+                    error.status, error.code, error.data,
+                ) from error
+            raise
+
     async def bump(self, game_id: int, category_ids: list[int]) -> dict:
         return await self.api(
             "POST",

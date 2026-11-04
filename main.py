@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 import json
 
+from lot_descriptions import CREATE_CURRENT, CREATE_JOBS, KIND_NAMES, TOWER_PLACEHOLDER
 from FunPay_sales import (
     CLOSE_REASONS,
     CREATE_CLOSED_ORDERS,
@@ -214,6 +215,8 @@ def init_db():
     db.execute(CREATE_CLOSED_ORDERS)
     ensure_closed_orders_columns(db)
     db.execute(CREATE_FINISHED_ORDERS)
+    db.execute(CREATE_JOBS)
+    db.execute(CREATE_CURRENT)
     db.commit()
 
     # Проверяем и добавляем отсутствующие колонки
@@ -2630,6 +2633,120 @@ async def menu_set_sales_channel(interaction: discord.Interaction):
     await send_result(interaction, "Карточки новых продаж FunPay и Starvell будут приходить в этот канал.")
 
 
+# -----------------------------
+# /lot-description — полное описание лотов FunPay и Starvell
+# -----------------------------
+#
+# Меняет описание сам FunPay-/Starvell-бот (lot_descriptions.py, другой
+# процесс): здесь только форма и задание в базе основного сервера.
+
+LOT_KIND_CHOICES = [
+    app_commands.Choice(name="💰 Монеты", value="coins"),
+    app_commands.Choice(name="💎 Гемы", value="gems"),
+    app_commands.Choice(name="💠 Опыт (все башни)", value="xp"),
+]
+
+LOT_PLATFORM_CHOICES = [
+    app_commands.Choice(name="FunPay и Starvell", value="funpay,starvell"),
+    app_commands.Choice(name="Только FunPay", value="funpay"),
+    app_commands.Choice(name="Только Starvell", value="starvell"),
+]
+
+
+class LotDescriptionModal(discord.ui.Modal):
+    def __init__(self, kind: str, platforms: str, current: str):
+        super().__init__(title=f"Описание лотов {KIND_NAMES[kind]}", timeout=900)
+        self.kind = kind
+        self.platforms = platforms
+
+        hint = f" ({TOWER_PLACEHOLDER} — название башни)" if kind == "xp" else ""
+        self.text = discord.ui.TextInput(
+            label=f"Полное описание{hint}"[:45],
+            style=discord.TextStyle.paragraph,
+            default=current[:4000] or None,
+            placeholder=(
+                f"Например: Фарм уровня на {TOWER_PLACEHOLDER} до 20 уровня"
+                if kind == "xp" else None
+            ),
+            max_length=4000,
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        with use_guild(None):
+            db.execute(
+                """
+                INSERT INTO lot_description_jobs(kind, platforms, text, channel_id, user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.kind,
+                    self.platforms,
+                    self.text.value,
+                    interaction.channel_id,
+                    interaction.user.id,
+                    datetime.now(timezone.utc).isoformat()
+                )
+            )
+            db.commit()
+
+        await send_result(
+            interaction,
+            f"⏳ Меняю описание лотов {KIND_NAMES[self.kind]}… Итог придёт в этот канал."
+        )
+
+
+@bot.tree.command(name="lot-description", description="Изменить полное описание лотов монет, гемов или опыта")
+@app_commands.describe(kind="Какие лоты", platforms="На каких площадках")
+@app_commands.choices(kind=LOT_KIND_CHOICES, platforms=LOT_PLATFORM_CHOICES)
+async def menu_lot_description(
+    interaction: discord.Interaction,
+    kind: app_commands.Choice[str],
+    platforms: Optional[app_commands.Choice[str]] = None
+):
+    if not is_manager(interaction):
+        return await deny(interaction)
+
+    with use_guild(None):
+        current = db.execute(
+            "SELECT text FROM lot_descriptions WHERE kind = ?",
+            (kind.value,)
+        ).fetchone()
+
+    await interaction.response.send_modal(
+        LotDescriptionModal(
+            kind.value,
+            platforms.value if platforms else "funpay,starvell",
+            current["text"] if current else ""
+        )
+    )
+
+
+async def report_lot_description_jobs():
+    """Итоги смены описаний (их записывает lot_descriptions.py)."""
+    with use_guild(None):
+        jobs = db.execute(
+            "SELECT * FROM lot_description_jobs WHERE status = 'done'"
+        ).fetchall()
+
+        for job in jobs:
+            try:
+                channel = bot.get_channel(job["channel_id"]) or await bot.fetch_channel(job["channel_id"])
+                await channel.send(
+                    f"<@{job['user_id']}> Описание лотов {KIND_NAMES.get(job['kind'], '')}:\n{job['result']}"[:2000],
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
+            except discord.HTTPException as error:
+                print(f"[lots] Не удалось отправить итог смены описания: {error}")
+
+            db.execute(
+                "UPDATE lot_description_jobs SET status = 'reported' WHERE id = ?",
+                (job["id"],)
+            )
+
+        db.commit()
+
+
 @menu_group.command(name="set-stale-channel", description="Сделать этот канал каналом уведомлений о просрочке")
 async def menu_set_stale_channel(interaction: discord.Interaction):
     if not is_manager(interaction):
@@ -3308,6 +3425,11 @@ async def sales_loop():
             await process_closed_orders()
         except Exception as error:
             print(f"[closed_orders] Ошибка: {error!r}")
+
+        try:
+            await report_lot_description_jobs()
+        except Exception as error:
+            print(f"[lots] Ошибка: {error!r}")
 
         # Базу меняет и FunPay-бот (другой процесс): например, /info ник
         # ставит ссылку на чат. Перерисовываем таблицы — правятся только
