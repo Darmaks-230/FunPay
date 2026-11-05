@@ -57,8 +57,8 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 IMAGE_TEXT = "📷 Картинка"
 
-CHANNEL_DELETE_AFTER_DAYS = 1
-CHANNEL_CLEANUP_INTERVAL = 60 * 60
+CHANNEL_DELETE_AFTER_HOURS = 16
+CHANNEL_CLEANUP_INTERVAL = 10 * 60
 
 CHANNELS_FILE = BASE_DIR / "funpay_channels.json"
 
@@ -1152,98 +1152,99 @@ async def send_to_events_channel(
 # Удаление неактивных каналов
 # =========================
 
+def channel_last_activity(channel, saved: datetime | None = None) -> datetime:
+    """
+    Когда в канале было последнее сообщение. Смотрим и в сам Discord:
+    сохранённое время может потеряться (например, при переносе бота
+    на другой сервер).
+    """
+
+    times = [channel.created_at]
+
+    if channel.last_message_id:
+        times.append(discord.utils.snowflake_time(channel.last_message_id))
+
+    if saved is not None:
+        times.append(saved)
+
+    return max(times)
+
+
+def stale_channels(prefix: str, saved_channels: dict) -> list:
+    """
+    Каналы покупателей с этой приставкой, где дольше
+    CHANNEL_DELETE_AFTER_HOURS не было сообщений:
+    [(ключ в saved_channels или None, канал или None)].
+    Каналы с приставкой, которых нет в saved_channels, тоже удаляются.
+    """
+
+    inactive_since = datetime.now(timezone.utc) - timedelta(hours=CHANNEL_DELETE_AFTER_HOURS)
+    result = []
+    known_ids = set()
+
+    for key, data in list(saved_channels.items()):
+        channel = discord_guild.get_channel(data.get("channel_id"))
+        saved = parse_iso_datetime(data.get("last_activity"))
+
+        if channel is None:
+            # Канал уже удалили вручную: просто забываем его
+            result.append((key, None))
+            continue
+
+        known_ids.add(channel.id)
+        if channel_last_activity(channel, saved) < inactive_since:
+            result.append((key, channel))
+
+    for channel in discord_category.text_channels:
+        if (
+            channel.name.startswith(prefix)
+            and channel.id not in known_ids
+            and channel_last_activity(channel) < inactive_since
+        ):
+            result.append((None, channel))
+
+    return result
+
+
+async def delete_stale_channels(prefix: str, saved_channels: dict, platform: str) -> bool:
+    """Удаляет каналы без сообщений; True, если saved_channels изменился."""
+
+    changed = False
+
+    for key, channel in stale_channels(prefix, saved_channels):
+        try:
+            if channel is not None:
+                await channel.delete(
+                    reason=f"Канал {platform} неактивен {CHANNEL_DELETE_AFTER_HOURS} ч."
+                )
+                logging.info("Удалён неактивный канал #%s", channel.name)
+
+        except discord.NotFound:
+            pass
+
+        except discord.Forbidden:
+            logging.error("Нет прав на удаление канала")
+            continue
+
+        except discord.HTTPException as error:
+            logging.error("Ошибка удаления канала: %s", error)
+            continue
+
+        if key is not None:
+            saved_channels.pop(key, None)
+            changed = True
+
+    return changed
+
+
 async def cleanup_inactive_channels():
     await discord_ready.wait()
 
     while not discord_client.is_closed():
         try:
-            inactive_since = (
-                datetime.now(timezone.utc)
-                - timedelta(
-                    days=CHANNEL_DELETE_AFTER_DAYS
-                )
-            )
-
             async with channel_lock:
-                channels_to_delete = []
-
-                for channel_key, data in list(
-                    user_channels.items()
-                ):
-                    last_activity = parse_iso_datetime(
-                        data.get("last_activity")
-                    )
-
-                    channel_id = data.get(
-                        "channel_id"
-                    )
-
-                    channel = discord_guild.get_channel(
-                        channel_id
-                    )
-
-                    if last_activity is None:
-                        if channel is not None:
-                            last_activity = (
-                                channel.created_at
-                            )
-                        else:
-                            last_activity = datetime.min.replace(
-                                tzinfo=timezone.utc
-                            )
-
-                    if last_activity < inactive_since:
-                        channels_to_delete.append(
-                            (
-                                channel_key,
-                                channel
-                            )
-                        )
-
-                for channel_key, channel in (
-                    channels_to_delete
-                ):
-                    try:
-                        if channel is not None:
-                            channel_name = channel.name
-
-                            await channel.delete(
-                                reason=(
-                                    "Канал FunPay неактивен "
-                                    f"{CHANNEL_DELETE_AFTER_DAYS} дн."
-                                )
-                            )
-
-                            print(
-                                f"Удалён неактивный канал "
-                                f"#{channel_name}"
-                            )
-
-                    except discord.NotFound:
-                        pass
-
-                    except discord.Forbidden:
-                        logging.error(
-                            "Нет прав на удаление канала"
-                        )
-                        continue
-
-                    except discord.HTTPException as error:
-                        logging.error(
-                            "Ошибка удаления канала: %s",
-                            error
-                        )
-                        continue
-
-                    user_channels.pop(
-                        channel_key,
-                        None
-                    )
-
-                if channels_to_delete:
-                    save_channels(
-                        user_channels
-                    )
+                if await delete_stale_channels("funpay-", user_channels, "FunPay"):
+                    save_channels(user_channels)
 
         except Exception:
             logging.exception(

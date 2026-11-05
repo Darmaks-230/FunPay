@@ -67,7 +67,6 @@ CHATS_POLL_SECONDS = 5
 ORDERS_POLL_SECONDS = 10
 FARM_CHECK_SECONDS = 30
 LOTS_CACHE_SECONDS = 60 * 60
-CHANNEL_DELETE_AFTER_DAYS = funpay_messages.CHANNEL_DELETE_AFTER_DAYS
 
 STATE_FILE = BASE_DIR / "starvell_state.json"
 CHANNELS_FILE = BASE_DIR / "starvell_channels.json"
@@ -357,28 +356,9 @@ async def cleanup_inactive_channels():
 
 
 async def delete_inactive_channels():
-    inactive_since = datetime.now(timezone.utc) - timedelta(days=CHANNEL_DELETE_AFTER_DAYS)
-
     async with channel_lock:
-        for chat_id, data in list(user_channels.items()):
-            last_activity = parse_time(data.get("last_activity"))
-            if last_activity and last_activity >= inactive_since:
-                continue
-
-            channel = discord_guild().get_channel(data.get("channel_id"))
-            try:
-                if channel is not None:
-                    await channel.delete(reason=f"Канал Starvell неактивен {CHANNEL_DELETE_AFTER_DAYS} дн.")
-                    log.info("Удалён неактивный канал #%s", channel.name)
-            except discord.NotFound:
-                pass
-            except discord.HTTPException as error:
-                log.error("Ошибка удаления канала: %s", error)
-                continue
-
-            user_channels.pop(chat_id, None)
-
-        save_json(CHANNELS_FILE, user_channels)
+        if await funpay_messages.delete_stale_channels("starvell-", user_channels, "Starvell"):
+            save_json(CHANNELS_FILE, user_channels)
 
 
 # =========================
