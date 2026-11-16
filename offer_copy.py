@@ -64,16 +64,32 @@ async def copy_offer(source, target, offer_id: int) -> None:
     node_id = int(fields.fields_dict["node_id"])
 
     # Пустая форма нового лота в том же разделе
-    new_fields = await target.get_offer_fields(
-        subcategory_type=SubcategoryType.OFFERS,
-        subcategory_id=node_id,
-    )
+    try:
+        new_fields = await target.get_offer_fields(
+            subcategory_type=SubcategoryType.OFFERS,
+            subcategory_id=node_id,
+        )
+    except Exception as error:
+        raise RuntimeError(f"не открылась форма нового лота (раздел {node_id}): {error}") from error
 
     for key, value in fields.fields_dict.items():
         if key not in SKIP_FIELDS:
             new_fields.set_field(key, value)
 
-    await target.save_offer_fields(new_fields)
+    # В форме нового лота раздела может не оказаться — без него FunPay
+    # отвечает «Категория не найдена»
+    new_fields.set_field("node_id", node_id)
+    new_fields.fields_dict.setdefault("offer_id", "0")
+
+    try:
+        await target.save_offer_fields(new_fields)
+    except Exception as error:
+        fields_error = getattr(error, "fields", None)
+        details = f" {fields_error}" if fields_error else ""
+        raise RuntimeError(
+            f"FunPay не сохранил лот: {error}{details} "
+            f"(поля формы: {', '.join(sorted(new_fields.fields_dict))})"
+        ) from error
 
 
 async def copy_to_account(source, number: str) -> None:
