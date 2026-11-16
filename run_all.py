@@ -12,21 +12,42 @@
 (funpay_shared.py): один опрос событий вместо двух и одна сессия
 для поднятия. Если какой-то бот упадёт, он перезапустится сам,
 остальные продолжат работать.
+
+Дополнительные аккаунты FunPay/Starvell (FUNPAY_GOLDEN_KEY_2,
+STARVELL_SESSION_2, ... в .env, см. accounts.py) запускаются отдельными
+процессами: run_all.py --account 2. Таблица и Discord у них общие.
 """
 
+import argparse
 import asyncio
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
-from funpay_shared import BASE_DIR, bot, chat_storage, dispatcher
+from dotenv import load_dotenv
 
-import FunPay_commands
-import FunPay_messages
-import FunPay_sales
-import Starvell_bot
-import auto_raise
-import lot_descriptions
+import accounts
+
+
+def parse_account() -> str:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--account", default=accounts.MAIN_ACCOUNT)
+    return parser.parse_args().account
+
+
+# Настройки аккаунта подменяются до импорта ботов: они читают .env при импорте
+load_dotenv(Path(__file__).resolve().parent / ".env")
+accounts.use_account(parse_account())
+
+from funpay_shared import BASE_DIR, FUNPAY_ENABLED, bot, chat_storage, dispatcher  # noqa: E402
+
+import FunPay_commands  # noqa: E402
+import FunPay_messages  # noqa: E402
+import FunPay_sales  # noqa: E402
+import Starvell_bot  # noqa: E402
+import auto_raise  # noqa: E402
+import lot_descriptions  # noqa: E402
 
 
 RESTART_DELAY_SECONDS = 15
@@ -40,7 +61,9 @@ def setup_logging() -> None:
     log_dir.mkdir(exist_ok=True)
 
     file_handler = RotatingFileHandler(
-        log_dir / "bots.log",
+        # У каждого аккаунта свой файл: несколько процессов не могут
+        # по очереди переименовывать один и тот же лог
+        accounts.state_file("logs/bots.log"),
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -109,6 +132,31 @@ async def run_main_table_bot() -> None:
             await process.wait()
 
 
+async def run_extra_account(number: str) -> None:
+    """Дополнительный аккаунт — отдельный процесс со своими настройками."""
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "run_all.py"),
+        "--account",
+        number,
+        cwd=str(BASE_DIR),
+    )
+
+    try:
+        return_code = await process.wait()
+        logging.getLogger("run_all").warning(
+            "Аккаунт %s завершился с кодом %s",
+            number,
+            return_code,
+        )
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await process.wait()
+
+
 async def run_funpay_messages_discord() -> None:
     client = FunPay_messages.discord_client
 
@@ -129,23 +177,39 @@ async def main() -> None:
         FunPay_sales.router,
     )
 
-    await asyncio.gather(
-        supervise("Discord-таблица (main.py)", run_main_table_bot),
-        supervise(
-            "Опрос FunPay",
-            lambda: bot.listen_events(dispatcher, session_storage=chat_storage),
-        ),
-        supervise("Discord для сообщений FunPay", run_funpay_messages_discord),
-        supervise("Очистка старых каналов", FunPay_messages.cleanup_inactive_channels),
-        supervise("Проверка фарма", FunPay_commands.farm_checker),
-        supervise(
-            "Автоподнятие",
-            auto_raise.raise_loop,
-            start_delay=RAISE_START_DELAY_SECONDS,
-        ),
-        supervise("Starvell", Starvell_bot.run),
-        supervise("Описания лотов", lot_descriptions.jobs_loop),
-    )
+    label = accounts.label()
+    tasks = [
+        supervise(f"Discord для сообщений{label}", run_funpay_messages_discord),
+        supervise(f"Starvell{label}", Starvell_bot.run),
+    ]
+
+    if FUNPAY_ENABLED:
+        tasks += [
+            supervise(
+                f"Опрос FunPay{label}",
+                lambda: bot.listen_events(dispatcher, session_storage=chat_storage),
+            ),
+            supervise(f"Очистка старых каналов{label}", FunPay_messages.cleanup_inactive_channels),
+            supervise(f"Проверка фарма{label}", FunPay_commands.farm_checker),
+            supervise(
+                f"Автоподнятие{label}",
+                auto_raise.raise_loop,
+                start_delay=RAISE_START_DELAY_SECONDS,
+            ),
+        ]
+
+    # Таблица и смена описаний — одни на все аккаунты
+    if accounts.is_main():
+        tasks += [
+            supervise("Discord-таблица (main.py)", run_main_table_bot),
+            supervise("Описания лотов", lot_descriptions.jobs_loop),
+        ]
+        tasks += [
+            supervise(f"Аккаунт {number}", lambda number=number: run_extra_account(number))
+            for number in accounts.extra_accounts()
+        ]
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

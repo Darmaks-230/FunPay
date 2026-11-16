@@ -17,6 +17,8 @@ from funpaybotengine import Router
 from funpaybotengine.dispatching.events import NewSaleEvent
 from funpaybotengine.types import Message
 
+import accounts
+
 
 # Без импорта funpay_shared: main.py берёт отсюда схему таблицы,
 # и ему не нужен FunPay-клиент.
@@ -72,7 +74,9 @@ def ensure_pending_sales_columns(connection) -> None:
     """
     form_data — данные формы заказа, поставленного в очередь
     (у того же аккаунта уже идёт фарм); short_id — короткий номер
-    заказа Starvell для показа. В базе от прошлых версий этих столбцов нет.
+    заказа Starvell для показа; account — номер аккаунта FunPay/Starvell,
+    на котором продажа (accounts.py). В базе от прошлых версий этих
+    столбцов нет.
     """
     columns = {row[1] for row in connection.execute("PRAGMA table_info(pending_sales)")}
 
@@ -81,6 +85,11 @@ def ensure_pending_sales_columns(connection) -> None:
             connection.execute(
                 f"ALTER TABLE pending_sales ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
             )
+
+    if "account" not in columns:
+        connection.execute(
+            "ALTER TABLE pending_sales ADD COLUMN account TEXT NOT NULL DEFAULT '1'"
+        )
 
 
 def ensure_closed_orders_columns(connection) -> None:
@@ -242,15 +251,16 @@ def save_sale(
     short_id: str = "",
 ) -> None:
     currency, amount = parse_sale_title(title)
+    accounts.remember_chat(chat_id)
 
     with connect() as connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO pending_sales(
                 order_id, buyer, chat_id, title, currency,
-                amount, price, created_at, short_id
+                amount, price, created_at, short_id, account
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -262,6 +272,7 @@ def save_sale(
                 price,
                 datetime.now(timezone.utc).isoformat(),
                 short_id,
+                accounts.current(),
             ),
         )
 

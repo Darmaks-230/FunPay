@@ -29,6 +29,7 @@ import aiohttp
 import discord
 
 import FunPay_commands as commands
+import accounts
 import FunPay_messages as funpay_messages
 from FunPay_sales import close_order, is_starvell_id, save_sale
 from starvell_api import (
@@ -68,8 +69,8 @@ ORDERS_POLL_SECONDS = 10
 FARM_CHECK_SECONDS = 30
 LOTS_CACHE_SECONDS = 60 * 60
 
-STATE_FILE = BASE_DIR / "starvell_state.json"
-CHANNELS_FILE = BASE_DIR / "starvell_channels.json"
+STATE_FILE = accounts.state_file("starvell_state.json")
+CHANNELS_FILE = accounts.state_file("starvell_channels.json")
 
 CDN_URL = "https://cdn.starvell.com"
 
@@ -408,6 +409,7 @@ async def handle_message(chat: dict, message: dict):
     chat_id = chat["id"]
     username = chat_usernames.get(chat_id, "")
     author_id = message.get("authorId")
+    accounts.remember_chat(chat_id)
     is_mine = author_id == starvell.user_id
 
     visible_to = message.get("visibleTo")
@@ -669,8 +671,9 @@ def finished_starvell_orders() -> set[str]:
     for database_path in commands.database_paths():
         try:
             with sqlite3.connect(database_path) as connection:
-                for (order_id,) in connection.execute("SELECT order_id FROM finished_orders"):
-                    if is_starvell_id(order_id):
+                for order_id, chat_id in connection.execute("SELECT order_id, chat_id FROM finished_orders"):
+                    # Заказ другого аккаунта Starvell подтвердит он сам
+                    if is_starvell_id(order_id) and (not chat_id or accounts.owns_chat(chat_id)):
                         order_ids.add(order_id)
         except sqlite3.Error as error:
             log.error("Ошибка чтения finished_orders из %s: %s", database_path.name, error)

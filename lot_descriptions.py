@@ -9,13 +9,17 @@ run_all.py рядом с FunPay- и Starvell-клиентами) меняет о
 Описание задаётся отдельно для лотов монет, гемов и опыта. В описании
 опыта {tower} заменяется названием башни из названия лота
 («ФАРМ УРОВНЯ НА KINGPIN» -> KINGPIN).
+
+Описание меняется на всех аккаунтах FunPay и Starvell (accounts.py).
 """
 
 import asyncio
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 
+import accounts
 from FunPay_sales import DATABASE_PATH
 
 
@@ -107,9 +111,46 @@ def to_template(text: str, tower: str) -> str:
 # FunPay
 # =========================
 
-async def funpay_user_id() -> int:
+# Клиенты дополнительных аккаунтов: номер -> клиент
+_funpay_bots = {}
+_starvell_clients = {}
+
+
+def funpay_bots() -> list[tuple[str, object]]:
+    """[(название для итога, клиент FunPay)] всех аккаунтов."""
+    from funpaybotengine import Bot
+    from funpay_shared import FUNPAY_ENABLED, bot
+
+    result = [("FunPay", bot)] if FUNPAY_ENABLED else []
+
+    for number in accounts.extra_accounts():
+        key = os.getenv(f"FUNPAY_GOLDEN_KEY_{number}", "").strip()
+        if key:
+            if number not in _funpay_bots:
+                _funpay_bots[number] = Bot(golden_key=key)
+            result.append((f"FunPay {number}", _funpay_bots[number]))
+
+    return result
+
+
+def starvell_clients() -> list[tuple[str, object]]:
+    """[(название для итога, клиент Starvell)] всех аккаунтов."""
+    from starvell_api import StarvellClient, starvell
+
+    result = [("Starvell", starvell)]
+
+    for number in accounts.extra_accounts():
+        session = os.getenv(f"STARVELL_SESSION_{number}", "").strip()
+        if session:
+            if number not in _starvell_clients:
+                _starvell_clients[number] = StarvellClient(session)
+            result.append((f"Starvell {number}", _starvell_clients[number]))
+
+    return result
+
+
+async def funpay_user_id(bot) -> int:
     from funpaybotengine.exceptions.bot_exceptions import BotNotInitializedError
-    from funpay_shared import bot
 
     try:
         return bot.userid
@@ -118,10 +159,8 @@ async def funpay_user_id() -> int:
         return bot.userid
 
 
-async def funpay_lots() -> list[tuple[int, str]]:
-    from funpay_shared import bot
-
-    profile = await bot.get_profile_page(await funpay_user_id())
+async def funpay_lots(bot) -> list[tuple[int, str]]:
+    profile = await bot.get_profile_page(await funpay_user_id(bot))
     return [
         (offer.id, offer.title or "")
         for groups in (profile.offers or {}).values()
@@ -144,11 +183,24 @@ def funpay_error_text(error: Exception, text: str = "") -> str:
 
 
 async def funpay_set(kind: str, text: str) -> str:
-    from funpay_shared import bot
+    bots = funpay_bots()
+    if not bots:
+        return "FunPay: не задан FUNPAY_GOLDEN_KEY"
 
-    lots = [(lot_id, title) for lot_id, title in await funpay_lots() if lot_kind(title)[0] == kind]
+    results = []
+    for name, bot in bots:
+        try:
+            results.append(await funpay_set_account(name, bot, kind, text))
+        except Exception as error:
+            log.exception("Ошибка смены описания (%s)", name)
+            results.append(f"❌ {name}: {error}")
+    return "\n".join(results)
+
+
+async def funpay_set_account(name: str, bot, kind: str, text: str) -> str:
+    lots = [(lot_id, title) for lot_id, title in await funpay_lots(bot) if lot_kind(title)[0] == kind]
     if not lots:
-        return f"FunPay: лотов {KIND_NAMES[kind]} не найдено"
+        return f"{name}: лотов {KIND_NAMES[kind]} не найдено"
 
     changed, errors = 0, []
 
@@ -163,7 +215,7 @@ async def funpay_set(kind: str, text: str) -> str:
             errors.append(f"{title.split('|')[0].strip()}: {funpay_error_text(error, text)}")
         await asyncio.sleep(SAVE_DELAY_SECONDS)
 
-    return summary("FunPay", changed, len(lots), errors)
+    return summary(name, changed, len(lots), errors)
 
 
 # =========================
@@ -174,9 +226,7 @@ def starvell_offer_title(offer: dict) -> str:
     return ((offer.get("descriptions") or {}).get("rus") or {}).get("briefDescription") or ""
 
 
-async def starvell_lots() -> list[tuple[str, str]]:
-    from starvell_api import starvell
-
+async def starvell_lots(starvell) -> list[tuple[str, str]]:
     if not starvell.user:
         await starvell.login()
 
@@ -189,14 +239,24 @@ async def starvell_lots() -> list[tuple[str, str]]:
 
 
 async def starvell_set(kind: str, text: str) -> str:
-    from starvell_api import starvell
-
-    if not starvell.enabled:
+    clients = [(name, client) for name, client in starvell_clients() if client.enabled]
+    if not clients:
         return "Starvell: не задан STARVELL_SESSION"
 
-    lots = [(lot_id, title) for lot_id, title in await starvell_lots() if lot_kind(title)[0] == kind]
+    results = []
+    for name, client in clients:
+        try:
+            results.append(await starvell_set_account(name, client, kind, text))
+        except Exception as error:
+            log.exception("Ошибка смены описания (%s)", name)
+            results.append(f"❌ {name}: {error}")
+    return "\n".join(results)
+
+
+async def starvell_set_account(name: str, starvell, kind: str, text: str) -> str:
+    lots = [(lot_id, title) for lot_id, title in await starvell_lots(starvell) if lot_kind(title)[0] == kind]
     if not lots:
-        return f"Starvell: лотов {KIND_NAMES[kind]} не найдено"
+        return f"{name}: лотов {KIND_NAMES[kind]} не найдено"
 
     changed, errors = 0, []
 
@@ -209,7 +269,7 @@ async def starvell_set(kind: str, text: str) -> str:
             errors.append(f"{title.split('|')[0].strip()}: {error}")
         await asyncio.sleep(SAVE_DELAY_SECONDS)
 
-    return summary("Starvell", changed, len(lots), errors)
+    return summary(name, changed, len(lots), errors)
 
 
 def summary(platform: str, changed: int, total: int, errors: list[str]) -> str:
@@ -254,12 +314,15 @@ async def run_job(job) -> str:
 
 
 async def refresh_current():
-    """Запоминает текущие описания (FunPay) для подстановки в форму."""
-    from funpay_shared import bot
+    """Запоминает текущие описания (первый аккаунт FunPay) для подстановки в форму."""
+    bots = funpay_bots()
+    if not bots:
+        return
+    bot = bots[0][1]
 
     found = {}
 
-    for lot_id, title in await funpay_lots():
+    for lot_id, title in await funpay_lots(bot):
         kind, tower = lot_kind(title)
         if kind is None or kind in found:
             continue

@@ -9,6 +9,7 @@ from pathlib import Path
 from funpaybotengine import Router
 from funpaybotengine.types import Message
 
+import accounts
 from funpay_shared import bot, dispatcher
 from FunPay_sales import (
     CREATE_FINISHED_ORDERS,
@@ -707,8 +708,11 @@ async def help_command(message: Message):
 # =================================================
 
 def is_platform_chat(chat_id, starvell: bool) -> bool:
-    """Чат Starvell — UUID, чат FunPay — число."""
-    return is_starvell_id(chat_id) == starvell
+    """
+    Чат этой площадки (Starvell — UUID, FunPay — число), и переписка
+    шла через этот аккаунт (accounts.py).
+    """
+    return is_starvell_id(chat_id) == starvell and accounts.owns_chat(chat_id)
 
 
 def get_active_orders(starvell: bool = False) -> list[dict]:

@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 import aiohttp
 import discord
 
+import accounts
+
 from funpaybotengine import Router
 from funpaybotengine.types import Message
 
@@ -60,7 +62,7 @@ IMAGE_TEXT = "📷 Картинка"
 CHANNEL_DELETE_AFTER_HOURS = 16
 CHANNEL_CLEANUP_INTERVAL = 10 * 60
 
-CHANNELS_FILE = BASE_DIR / "funpay_channels.json"
+CHANNELS_FILE = accounts.state_file("funpay_channels.json")
 
 
 # =========================
@@ -72,7 +74,8 @@ if not DISCORD_TOKEN:
         "В .env не найден DISCORD_TOKEN"
     )
 
-if not FUNPAY_OWNER_ID:
+# У дополнительных аккаунтов ID берётся из самого FunPay (is_owner_id)
+if not FUNPAY_OWNER_ID and accounts.is_main():
     raise RuntimeError(
         "В .env не найден FUNPAY_OWNER_ID"
     )
@@ -399,7 +402,14 @@ def is_owner_id(sender_id) -> bool:
     if sender_id is None:
         return False
 
-    return str(sender_id).strip() == FUNPAY_OWNER_ID
+    owner_id = FUNPAY_OWNER_ID
+    if not owner_id:
+        try:
+            owner_id = str(funpay_bot.userid)
+        except Exception:
+            return False
+
+    return str(sender_id).strip() == owner_id
 
 
 def display_username(
@@ -1341,6 +1351,8 @@ async def handle_funpay_message(message: Message):
             "не найден chat_id"
         )
         return
+
+    accounts.remember_chat(chat_id)
 
     image_url = get_image_url(
         message

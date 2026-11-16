@@ -2950,8 +2950,12 @@ def build_sale_embed(sale) -> discord.Embed:
     }.get(sale["currency"], "💰 монеты")
     status = sale["status"]
 
+    # Продажа дополнительного аккаунта: «FunPay 2», «Starvell 3»
+    account = sale["account"] if "account" in sale.keys() else "1"
+    platform = sale_platform(sale) + ("" if account in ("", "1") else f" {account}")
+
     embed = discord.Embed(
-        title=f"🛒 Продажа {sale_platform(sale)} #{sale_label(sale['order_id'])}",
+        title=f"🛒 Продажа {platform} #{sale_label(sale['order_id'])}",
         url=sale_link(sale["order_id"]),
         color={"new": 0x2ECC71, "queued": 0xE67E22}.get(status, 0x95A5A6)
     )

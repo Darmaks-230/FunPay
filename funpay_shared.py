@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from funpaybotengine import Bot, Dispatcher
 from funpaybotengine.storage.inmemory import InMemoryStorage
 
+import accounts
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -22,7 +24,10 @@ load_dotenv(BASE_DIR / ".env")
 
 GOLDEN_KEY = os.getenv("FUNPAY_GOLDEN_KEY", "").strip()
 
-if not GOLDEN_KEY:
+# У дополнительного аккаунта может быть только Starvell
+FUNPAY_ENABLED = bool(GOLDEN_KEY)
+
+if not FUNPAY_ENABLED and accounts.is_main():
     raise RuntimeError("Не найден FUNPAY_GOLDEN_KEY в файле .env")
 
 
