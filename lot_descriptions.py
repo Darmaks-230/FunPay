@@ -116,19 +116,28 @@ _funpay_bots = {}
 _starvell_clients = {}
 
 
+def funpay_extra_bot(number: str):
+    """Клиент FunPay дополнительного аккаунта или None, если ключа нет."""
+    from funpaybotengine import Bot
+
+    key = os.getenv(f"FUNPAY_GOLDEN_KEY_{number}", "").strip()
+    if not key:
+        return None
+    if number not in _funpay_bots:
+        _funpay_bots[number] = Bot(golden_key=key)
+    return _funpay_bots[number]
+
+
 def funpay_bots() -> list[tuple[str, object]]:
     """[(название для итога, клиент FunPay)] всех аккаунтов."""
-    from funpaybotengine import Bot
     from funpay_shared import FUNPAY_ENABLED, bot
 
     result = [("FunPay", bot)] if FUNPAY_ENABLED else []
 
     for number in accounts.extra_accounts():
-        key = os.getenv(f"FUNPAY_GOLDEN_KEY_{number}", "").strip()
-        if key:
-            if number not in _funpay_bots:
-                _funpay_bots[number] = Bot(golden_key=key)
-            result.append((f"FunPay {number}", _funpay_bots[number]))
+        extra_bot = funpay_extra_bot(number)
+        if extra_bot is not None:
+            result.append((f"FunPay {number}", extra_bot))
 
     return result
 

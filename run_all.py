@@ -48,6 +48,7 @@ import FunPay_sales  # noqa: E402
 import Starvell_bot  # noqa: E402
 import auto_raise  # noqa: E402
 import lot_descriptions  # noqa: E402
+import offer_copy  # noqa: E402
 
 
 RESTART_DELAY_SECONDS = 15
@@ -203,6 +204,11 @@ async def main() -> None:
         tasks += [
             supervise("Discord-таблица (main.py)", run_main_table_bot),
             supervise("Описания лотов", lot_descriptions.jobs_loop),
+            supervise(
+                "Копирование лотов на другие аккаунты",
+                offer_copy.copy_loop,
+                start_delay=RAISE_START_DELAY_SECONDS,
+            ),
         ]
         tasks += [
             supervise(f"Аккаунт {number}", lambda number=number: run_extra_account(number))
